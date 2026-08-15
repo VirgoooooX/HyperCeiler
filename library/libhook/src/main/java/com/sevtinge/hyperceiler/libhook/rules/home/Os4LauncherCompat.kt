@@ -32,8 +32,10 @@ class Os4LauncherCompat : HomeBaseHookNew() {
     private fun initOS4Hook() {
         val unlockHotseat = PrefsBridge.getBoolean("home_dock_unlock_hotseat")
         val unlockGrid = PrefsBridge.getBoolean("home_layout_unlock_grids_new")
+        val customizeIconSize = PrefsBridge.getBoolean("home_title_icon_size_enable")
         val cellX = PrefsBridge.getInt("home_layout_unlock_grids_cell_x", 4).coerceIn(3, 9)
         val cellY = PrefsBridge.getInt("home_layout_unlock_grids_cell_y", 6).coerceIn(4, 13)
+        val iconSize = PrefsBridge.getInt("home_title_icon_size", 182).coerceIn(50, 360)
 
         if (unlockHotseat) {
             if (Os4LauncherNativeBridge.patchHotseat(99)) {
@@ -48,6 +50,14 @@ class Os4LauncherCompat : HomeBaseHookNew() {
                 XposedLog.i(TAG, lpparam.packageName, "OS4: scheduled grid patch ${cellX}x${cellY}")
             } else {
                 XposedLog.e(TAG, lpparam.packageName, "OS4: failed to load/schedule grid native patch")
+            }
+        }
+
+        if (customizeIconSize) {
+            if (Os4LauncherNativeBridge.patchIconSize(iconSize)) {
+                XposedLog.i(TAG, lpparam.packageName, "OS4: scheduled icon-size patch $iconSize")
+            } else {
+                XposedLog.e(TAG, lpparam.packageName, "OS4: failed to load/schedule icon-size native patch")
             }
         }
 
