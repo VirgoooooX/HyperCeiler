@@ -23,6 +23,7 @@ import com.sevtinge.hyperceiler.common.utils.PrefsBridge;
 import com.sevtinge.hyperceiler.libhook.base.BaseLoad;
 import com.sevtinge.hyperceiler.libhook.rules.home.AnimDurationRatio;
 import com.sevtinge.hyperceiler.libhook.rules.home.DisablePrestart;
+import com.sevtinge.hyperceiler.libhook.rules.home.Os4LauncherCompat;
 import com.sevtinge.hyperceiler.libhook.rules.home.ScreenSwipe;
 import com.sevtinge.hyperceiler.libhook.rules.home.SeekPoints;
 import com.sevtinge.hyperceiler.libhook.rules.home.SetDeviceLevel;
@@ -92,6 +93,7 @@ import com.sevtinge.hyperceiler.libhook.rules.home.title.TitleFontSize;
 import com.sevtinge.hyperceiler.libhook.rules.home.widget.AllWidgetAnimation;
 import com.sevtinge.hyperceiler.libhook.rules.home.widget.AllowMoveAllWidgetToMinus;
 import com.sevtinge.hyperceiler.libhook.rules.home.widget.AlwaysShowMiuiWidget;
+import com.sevtinge.hyperceiler.libhook.utils.hookapi.tool.AppsTool;
 
 import java.util.Objects;
 
@@ -100,6 +102,10 @@ public class HomePhone extends BaseLoad {
 
     @Override
     public void onPackageLoaded() {
+        int launcherVersion = AppsTool.getPackageVersionCode(BaseLoad.getTarget());
+        boolean isOs4Launcher = launcherVersion >= 800000000 && launcherVersion < 900000000;
+        initHook(new Os4LauncherCompat(), isOs4Launcher);
+
         boolean gesturesEnabled = PrefsBridge.getBoolean("home_gesture_enable");
         boolean hasCornerGestureAction = PrefsBridge.getInt("home_navigation_assist_left_slide_action", 0) > 0
             || PrefsBridge.getInt("home_navigation_assist_right_slide_action", 0) > 0;
@@ -124,10 +130,12 @@ public class HomePhone extends BaseLoad {
 
         // 布局
         initHook(new SeekPoints(), PrefsBridge.getStringAsInt("home_other_seek_points", 0) > 0);
-        initHook(LayoutRules.INSTANCE, PrefsBridge.getBoolean("home_layout_unlock_grids_new") ||
-            PrefsBridge.getBoolean("home_layout_workspace_padding_bottom_enable") ||
-            PrefsBridge.getBoolean("home_layout_workspace_padding_top_enable") ||
-            PrefsBridge.getBoolean("home_layout_workspace_padding_horizontal_enable"));
+        initHook(LayoutRules.INSTANCE, !isOs4Launcher && (
+            PrefsBridge.getBoolean("home_layout_unlock_grids_new") ||
+                PrefsBridge.getBoolean("home_layout_workspace_padding_bottom_enable") ||
+                PrefsBridge.getBoolean("home_layout_workspace_padding_top_enable") ||
+                PrefsBridge.getBoolean("home_layout_workspace_padding_horizontal_enable")
+        ));
         // initHook(new UnlockGridsNoWord(), PrefsBridge.getBoolean("home_layout_unlock_grids_no_word"));
         initHook(new WorkspacePadding(),
             PrefsBridge.getBoolean("home_layout_workspace_padding_bottom_enable") ||
@@ -147,7 +155,7 @@ public class HomePhone extends BaseLoad {
         initHook(FolderVerticalSpacing.INSTANCE, PrefsBridge.getBoolean("home_folder_vertical_spacing_enable"));
 
         // 底栏
-        initHook(new UnlockHotseatIcon(), PrefsBridge.getBoolean("home_dock_unlock_hotseat"));
+        initHook(new UnlockHotseatIcon(), !isOs4Launcher && PrefsBridge.getBoolean("home_dock_unlock_hotseat"));
         initHook(ShowDockIconTitle.INSTANCE, PrefsBridge.getBoolean("home_dock_icon_title"));
         initHook(DockCustomNew.INSTANCE, PrefsBridge.getBoolean("home_dock_bg_custom_enable"));
         // initHook(DisableRecentsIcon.INSTANCE, PrefsBridge.getBoolean("home_dock_disable_recents_icon"));
