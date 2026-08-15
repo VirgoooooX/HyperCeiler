@@ -69,6 +69,11 @@ object XposedLog {
         }
     }
 
+    private fun isDualRowDiagnostic(tag: String? = null, msg: String): Boolean {
+        return tag?.contains("DualRowSignal", ignoreCase = true) == true ||
+            msg.contains("DualRowSignal", ignoreCase = true)
+    }
+
     @Suppress("DEPRECATION")
     private fun logRaw(priority: Int, msg: String, t: Throwable? = null) {
         val xposed = sXposed
@@ -106,79 +111,79 @@ object XposedLog {
     // --- Full logs: 2 ---
     @JvmStatic
     fun d(msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(msg = msg)) return
         logRaw(Log.DEBUG, msg)
     }
 
     @JvmStatic
     fun d(tag: String, msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.DEBUG, "[$tag]: $msg")
     }
 
     @JvmStatic
     fun d(tag: String, msg: String, t: Throwable) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.DEBUG, "[$tag]: $msg", t)
     }
 
     @JvmStatic
     fun d(tag: String, pkg: String?, msg: String) {
         probeDualRowGate(pkg)
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.DEBUG, LoggerUtils.formatBrackets(pkg, tag, msg))
     }
 
     // --- Full logs: 2 ---
     @JvmStatic
     fun i(msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(msg = msg)) return
         logRaw(Log.INFO, msg)
     }
 
     @JvmStatic
     fun i(tag: String, msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.INFO, "[$tag]: $msg")
     }
 
     @JvmStatic
     fun i(tag: String, pkg: String?, msg: String) {
         probeDualRowGate(pkg)
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.INFO, LoggerUtils.formatBrackets(pkg, tag, msg))
     }
 
     // --- Full logs: 2 ---
     @JvmStatic
     fun w(msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(msg = msg)) return
         logRaw(Log.WARN, msg)
     }
 
     @JvmStatic
     fun w(tag: String, msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.WARN, "[$tag]: $msg")
     }
 
     @JvmStatic
     fun w(tag: String, msg: String, t: Throwable) {
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.WARN, "[$tag]: $msg", t)
     }
 
     @JvmStatic
     fun w(tag: String, pkg: String?, msg: String) {
         probeDualRowGate(pkg)
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.WARN, LoggerUtils.formatBrackets(pkg, tag, msg))
     }
 
     @JvmStatic
     fun w(tag: String, pkg: String?, msg: String, t: Throwable) {
         probeDualRowGate(pkg)
-        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE)) return
+        if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.WARN, LoggerUtils.formatBrackets(pkg, tag, msg), t)
     }
 
