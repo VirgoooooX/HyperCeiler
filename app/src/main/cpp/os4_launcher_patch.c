@@ -1,13 +1,14 @@
 #define _GNU_SOURCE
 #include <jni.h>
+#include <android/log.h>
 #include <elf.h>
 #include <link.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 /*
@@ -15,9 +16,30 @@
  * RELEASE-8.01.02.5334-260807-08151151-R
  * libapp.so Build ID: 4f1bdaed80328aa4b22817f1e00300bf
  *
- * All RVAs below were recovered from libapp.so .gnu_debugdata.
- * Keep this table build-specific: never reuse these offsets for another OTA.
+ * The first implementation modified Dart AOT text pages directly with
+ * mprotect(RWX). Android 17 can reject writable+executable transitions, so
+ * this revision uses LSPosed's Native Hook API instead. Build-ID and original
+ * instruction checks are still kept before installing each inline hook.
  */
+
+#define LOG_TAG "HyperCeilerOS4"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+typedef int (*HookFunType)(void *func, void *replace, void **backup);
+typedef int (*UnhookFunType)(void *func);
+typedef void (*NativeOnModuleLoaded)(const char *name, void *handle);
+
+typedef struct {
+    uint32_t version;
+    HookFunType hook_func;
+    UnhookFunType unhook_func;
+} NativeAPIEntries;
+
+static HookFunType g_hook_func = NULL;
+static UnhookFunType g_unhook_func = NULL;
+
 static const uint8_t kSupportedBuildId[] = {
     0x4f, 0x1b, 0xda, 0xed, 0x80, 0x32, 0x8a, 0xa4,
     0xb2, 0x28, 0x17, 0xf1, 0xe0, 0x03, 0x00, 0xbf,
@@ -42,16 +64,17 @@ static const uint8_t kExpectedIconSizePrologue[12] = {
     0xef, 0x81, 0x00, 0xd1,
 };
 
-enum PatchKind {
-    PATCH_HOTSEAT = 1,
-    PATCH_GRID = 2,
-    PATCH_ICON_SIZE = 3,
-};
-
-struct PatchRequest {
-    enum PatchKind kind;
-    int first;
-    int second;
+enum StatusBits {
+    STATUS_NATIVE_API_READY = 1 << 0,
+    STATUS_LIBAPP_FOUND     = 1 << 1,
+    STATUS_BUILD_SUPPORTED  = 1 << 2,
+    STATUS_HOTSEAT_HOOKED   = 1 << 3,
+    STATUS_GRID_XMAX_HOOKED = 1 << 4,
+    STATUS_GRID_XMIN_HOOKED = 1 << 5,
+    STATUS_GRID_XDEF_HOOKED = 1 << 6,
+    STATUS_GRID_YDEF_HOOKED = 1 << 7,
+    STATUS_ICON_HOOKED      = 1 << 8,
+    STATUS_LOAD_CALLBACK    = 1 << 9,
 };
 
 struct FindResult {
@@ -59,6 +82,31 @@ struct FindResult {
     bool found_name;
     bool supported;
 };
+
+static pthread_mutex_t g_install_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_status = 0;
+
+static atomic_bool g_hotseat_enabled = false;
+static atomic_bool g_grid_enabled = false;
+static atomic_bool g_icon_enabled = false;
+static atomic_int g_hotseat_max = 99;
+static atomic_int g_cell_x = 4;
+static atomic_int g_cell_y = 6;
+static atomic_int g_icon_size = 182;
+
+static bool g_hotseat_hooked = false;
+static bool g_grid_xmax_hooked = false;
+static bool g_grid_xmin_hooked = false;
+static bool g_grid_xdef_hooked = false;
+static bool g_grid_ydef_hooked = false;
+static bool g_icon_hooked = false;
+
+static void *g_hotseat_backup = NULL;
+static void *g_grid_xmax_backup = NULL;
+static void *g_grid_xmin_backup = NULL;
+static void *g_grid_xdef_backup = NULL;
+static void *g_grid_ydef_backup = NULL;
+static void *g_icon_backup = NULL;
 
 static inline uintptr_t align4(uintptr_t value) {
     return (value + 3u) & ~(uintptr_t)3u;
@@ -110,155 +158,260 @@ static int find_libapp_callback(struct dl_phdr_info *info, size_t size, void *da
     if (!ends_with_libapp(info->dlpi_name)) return 0;
 
     result->found_name = true;
+    result->base = (uintptr_t)info->dlpi_addr;
     result->supported = note_has_supported_build_id(info);
-    if (result->supported) result->base = (uintptr_t)info->dlpi_addr;
     return 1;
 }
 
-static bool patch_code(
+/*
+ * Dart AOT target replacements.
+ *
+ * The target functions use the AArch64 return registers we already confirmed
+ * from the supplied binary: raw integer in X0, tagged Smis in X0, and double
+ * in D0. Extra Dart calling-convention arguments are intentionally ignored.
+ */
+static uintptr_t replacement_hotseat_max_count(void) {
+    return (uintptr_t)atomic_load_explicit(&g_hotseat_max, memory_order_relaxed);
+}
+
+static inline uintptr_t dart_smi(int value) {
+    return (uintptr_t)((uint64_t)(uint32_t)(value << 1));
+}
+
+static uintptr_t replacement_cell_count_x_max(void) {
+    return dart_smi(9);
+}
+
+static uintptr_t replacement_cell_count_x_min(void) {
+    return dart_smi(3);
+}
+
+static uintptr_t replacement_cell_count_x_def(void) {
+    return dart_smi(atomic_load_explicit(&g_cell_x, memory_order_relaxed));
+}
+
+static uintptr_t replacement_cell_count_y_def(void) {
+    return dart_smi(atomic_load_explicit(&g_cell_y, memory_order_relaxed));
+}
+
+static double replacement_icon_size(void) {
+    return (double)atomic_load_explicit(&g_icon_size, memory_order_relaxed);
+}
+
+static bool verify_original(
     uintptr_t address,
-    const void *desired,
-    const void *expected,
-    size_t length
+    const uint8_t *expected,
+    size_t expected_size,
+    const char *name
 ) {
-    if (length == 0) return false;
-    if (memcmp((const void *)address, desired, length) == 0) return true;
-    if (memcmp((const void *)address, expected, length) != 0) return false;
+    if (memcmp((const void *)address, expected, expected_size) == 0) return true;
+    LOGE("%s: prologue mismatch at %p; refusing hook", name, (void *)address);
+    return false;
+}
 
-    const long page_size_long = sysconf(_SC_PAGESIZE);
-    if (page_size_long <= 0) return false;
-    const uintptr_t page_size = (uintptr_t)page_size_long;
-    const uintptr_t first_page = address & ~(page_size - 1u);
-    const uintptr_t end = address + length;
-    const uintptr_t last_page_end = (end + page_size - 1u) & ~(page_size - 1u);
-    const size_t protect_length = (size_t)(last_page_end - first_page);
+static bool install_one_hook(
+    uintptr_t target,
+    void *replacement,
+    void **backup,
+    const uint8_t *expected,
+    size_t expected_size,
+    const char *name
+) {
+    if (g_hook_func == NULL) {
+        LOGE("%s: LSPosed native hook API is not ready", name);
+        return false;
+    }
+    if (!verify_original(target, expected, expected_size, name)) return false;
 
-    if (mprotect(
-            (void *)first_page,
-            protect_length,
-            PROT_READ | PROT_WRITE | PROT_EXEC
-        ) != 0) {
+    const int result = g_hook_func((void *)target, replacement, backup);
+    if (result != 0) {
+        LOGE("%s: hook_func failed with code %d", name, result);
         return false;
     }
 
-    memcpy((void *)address, desired, length);
-    __builtin___clear_cache((char *)address, (char *)(address + length));
-    return mprotect((void *)first_page, protect_length, PROT_READ | PROT_EXEC) == 0;
+    LOGI("%s: hooked target=%p replacement=%p", name, (void *)target, replacement);
+    return true;
 }
 
-/* DeviceConfig.hotSeatMaxCount returns an unboxed native int in X0. */
-static uint32_t movz_x0_int(int value) {
-    const uint32_t imm = (uint32_t)value & 0xffffu;
-    return 0xD2800000u | (imm << 5u); /* MOVZ X0, #imm16 */
-}
+static void install_configured_hooks_at_base(uintptr_t base) {
+    if (base == 0) return;
 
-static uint32_t movz_w0_int(int value) {
-    const uint32_t imm = (uint32_t)value & 0xffffu;
-    return 0x52800000u | (imm << 5u); /* MOVZ W0, #imm16 */
-}
+    pthread_mutex_lock(&g_install_lock);
 
-static bool patch_encoded_return(uintptr_t address, uint32_t encoded_value, const uint8_t expected[8]) {
-    const uint32_t desired[2] = {
-        movz_x0_int((int)encoded_value),
-        0xD65F03C0u, /* RET */
-    };
-    return patch_code(address, desired, expected, sizeof(desired));
-}
-
-static uint32_t dart_smi(int value) {
-    /* 64-bit Dart AOT with compressed pointers uses a one-bit Smi tag shift. */
-    return (uint32_t)(value << 1);
-}
-
-static bool apply_hotseat_patch(uintptr_t base, int max_count) {
-    if (max_count < 5 || max_count > 99) return false;
-    return patch_encoded_return(
-        base + kRvaHotseatMaxCount, (uint32_t)max_count, kExpectedHotseatPrologue
-    );
-}
-
-static bool apply_grid_patch(uintptr_t base, int cell_x, int cell_y) {
-    if (cell_x < 3 || cell_x > 9 || cell_y < 4 || cell_y > 13) return false;
-
-    /*
-     * These four DeviceConfig getters return tagged Dart ints (Smis), unlike
-     * hotSeatMaxCount above. Returning a raw odd integer would be interpreted
-     * as a heap object pointer and can crash the launcher.
-     */
-    bool ok = true;
-    ok &= patch_encoded_return(base + kRvaCellCountXMax, dart_smi(9), kExpectedConfigGetterPrologue);
-    ok &= patch_encoded_return(base + kRvaCellCountXMin, dart_smi(3), kExpectedConfigGetterPrologue);
-    ok &= patch_encoded_return(base + kRvaCellCountXDef, dart_smi(cell_x), kExpectedConfigGetterPrologue);
-    ok &= patch_encoded_return(base + kRvaCellCountYDef, dart_smi(cell_y), kExpectedConfigGetterPrologue);
-    return ok;
-}
-
-static bool apply_icon_size_patch(uintptr_t base, int icon_size) {
-    if (icon_size < 50 || icon_size > 360) return false;
-
-    /*
-     * _IconConfig.getIconSize returns an unboxed double in D0. HyperCeiler's
-     * existing preference is a pixel-like integer (50..360), so convert the
-     * immediate W0 value to double and return it directly:
-     *   mov   w0, #icon_size
-     *   scvtf d0, w0
-     *   ret
-     */
-    const uint32_t desired[3] = {
-        movz_w0_int(icon_size),
-        0x1E620000u, /* SCVTF D0, W0 */
-        0xD65F03C0u, /* RET */
-    };
-    return patch_code(
-        base + kRvaIconSize,
-        desired,
-        kExpectedIconSizePrologue,
-        sizeof(desired)
-    );
-}
-
-static void *patch_worker(void *opaque) {
-    struct PatchRequest *request = (struct PatchRequest *)opaque;
-
-    /* Start from package-load time and wait until Flutter maps libapp.so. */
-    for (int attempt = 0; attempt < 5000; ++attempt) {
-        struct FindResult result = {0};
-        dl_iterate_phdr(find_libapp_callback, &result);
-
-        if (result.found_name) {
-            if (result.supported && result.base != 0) {
-                if (request->kind == PATCH_HOTSEAT) {
-                    (void)apply_hotseat_patch(result.base, request->first);
-                } else if (request->kind == PATCH_GRID) {
-                    (void)apply_grid_patch(result.base, request->first, request->second);
-                } else if (request->kind == PATCH_ICON_SIZE) {
-                    (void)apply_icon_size_patch(result.base, request->first);
-                }
-            }
-            free(request);
-            return NULL;
-        }
-        usleep(2000); /* 2 ms, max ~10 s */
+    if (atomic_load_explicit(&g_hotseat_enabled, memory_order_relaxed) && !g_hotseat_hooked) {
+        g_hotseat_hooked = install_one_hook(
+            base + kRvaHotseatMaxCount,
+            (void *)replacement_hotseat_max_count,
+            &g_hotseat_backup,
+            kExpectedHotseatPrologue,
+            sizeof(kExpectedHotseatPrologue),
+            "DeviceConfig.hotSeatMaxCount"
+        );
+        if (g_hotseat_hooked) atomic_fetch_or(&g_status, STATUS_HOTSEAT_HOOKED);
     }
 
-    free(request);
+    if (atomic_load_explicit(&g_grid_enabled, memory_order_relaxed)) {
+        if (!g_grid_xmax_hooked) {
+            g_grid_xmax_hooked = install_one_hook(
+                base + kRvaCellCountXMax,
+                (void *)replacement_cell_count_x_max,
+                &g_grid_xmax_backup,
+                kExpectedConfigGetterPrologue,
+                sizeof(kExpectedConfigGetterPrologue),
+                "DeviceConfig.cellCountXMax"
+            );
+            if (g_grid_xmax_hooked) atomic_fetch_or(&g_status, STATUS_GRID_XMAX_HOOKED);
+        }
+        if (!g_grid_xmin_hooked) {
+            g_grid_xmin_hooked = install_one_hook(
+                base + kRvaCellCountXMin,
+                (void *)replacement_cell_count_x_min,
+                &g_grid_xmin_backup,
+                kExpectedConfigGetterPrologue,
+                sizeof(kExpectedConfigGetterPrologue),
+                "DeviceConfig.cellCountXMin"
+            );
+            if (g_grid_xmin_hooked) atomic_fetch_or(&g_status, STATUS_GRID_XMIN_HOOKED);
+        }
+        if (!g_grid_xdef_hooked) {
+            g_grid_xdef_hooked = install_one_hook(
+                base + kRvaCellCountXDef,
+                (void *)replacement_cell_count_x_def,
+                &g_grid_xdef_backup,
+                kExpectedConfigGetterPrologue,
+                sizeof(kExpectedConfigGetterPrologue),
+                "DeviceConfig.cellCountXDef"
+            );
+            if (g_grid_xdef_hooked) atomic_fetch_or(&g_status, STATUS_GRID_XDEF_HOOKED);
+        }
+        if (!g_grid_ydef_hooked) {
+            g_grid_ydef_hooked = install_one_hook(
+                base + kRvaCellCountYDef,
+                (void *)replacement_cell_count_y_def,
+                &g_grid_ydef_backup,
+                kExpectedConfigGetterPrologue,
+                sizeof(kExpectedConfigGetterPrologue),
+                "DeviceConfig.cellCountYDef"
+            );
+            if (g_grid_ydef_hooked) atomic_fetch_or(&g_status, STATUS_GRID_YDEF_HOOKED);
+        }
+    }
+
+    if (atomic_load_explicit(&g_icon_enabled, memory_order_relaxed) && !g_icon_hooked) {
+        g_icon_hooked = install_one_hook(
+            base + kRvaIconSize,
+            (void *)replacement_icon_size,
+            &g_icon_backup,
+            kExpectedIconSizePrologue,
+            sizeof(kExpectedIconSizePrologue),
+            "_IconConfig.getIconSize"
+        );
+        if (g_icon_hooked) atomic_fetch_or(&g_status, STATUS_ICON_HOOKED);
+    }
+
+    pthread_mutex_unlock(&g_install_lock);
+}
+
+static bool find_and_install_if_loaded(void) {
+    struct FindResult result = {0};
+    dl_iterate_phdr(find_libapp_callback, &result);
+
+    if (!result.found_name) {
+        LOGI("libapp.so is not mapped yet; waiting for LSPosed load callback");
+        return true;
+    }
+
+    atomic_fetch_or(&g_status, STATUS_LIBAPP_FOUND);
+
+    if (!result.supported) {
+        LOGE("libapp.so found but Build ID is unsupported; refusing all hooks");
+        return false;
+    }
+
+    atomic_fetch_or(&g_status, STATUS_BUILD_SUPPORTED);
+    LOGI("supported libapp.so found at base=%p", (void *)result.base);
+    install_configured_hooks_at_base(result.base);
+    return true;
+}
+
+static void *install_after_load_worker(void *unused) {
+    (void)unused;
+    /*
+     * Leave the linker callback before iterating program headers / invoking
+     * inline hooks. This avoids doing non-trivial linker work while dlopen is
+     * still unwinding.
+     */
+    usleep(1000);
+    (void)find_and_install_if_loaded();
     return NULL;
 }
 
-static bool enqueue_patch(enum PatchKind kind, int first, int second) {
-    struct PatchRequest *request = (struct PatchRequest *)calloc(1, sizeof(*request));
-    if (request == NULL) return false;
-    request->kind = kind;
-    request->first = first;
-    request->second = second;
-
+static void schedule_install_after_load(void) {
     pthread_t thread;
-    if (pthread_create(&thread, NULL, patch_worker, request) != 0) {
-        free(request);
-        return false;
+    if (pthread_create(&thread, NULL, install_after_load_worker, NULL) == 0) {
+        pthread_detach(thread);
+    } else {
+        LOGE("failed to create post-load hook worker");
     }
-    pthread_detach(thread);
-    return true;
+}
+
+static void on_library_loaded(const char *name, void *handle) {
+    (void)handle;
+    if (!ends_with_libapp(name)) return;
+
+    atomic_fetch_or(&g_status, STATUS_LOAD_CALLBACK);
+    LOGI("LSPosed native callback observed %s", name != NULL ? name : "libapp.so");
+    schedule_install_after_load();
+}
+
+/*
+ * LSPosed Modern Native Hook entrypoint. The library name is declared in
+ * META-INF/xposed/native_init.list. System.loadLibrary from the Java bridge
+ * loads this module inside com.miui.home; LSPosed calls native_init and gives
+ * us its inline hook implementation.
+ */
+__attribute__((visibility("default"), used))
+NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
+    if (entries == NULL || entries->hook_func == NULL) {
+        LOGE("native_init called without hook_func");
+        return on_library_loaded;
+    }
+
+    g_hook_func = entries->hook_func;
+    g_unhook_func = entries->unhook_func;
+    atomic_fetch_or(&g_status, STATUS_NATIVE_API_READY);
+    LOGI(
+        "native_init ready: API version=%u hook_func=%p unhook_func=%p",
+        entries->version,
+        (void *)g_hook_func,
+        (void *)g_unhook_func
+    );
+    return on_library_loaded;
+}
+
+static bool configure_hotseat(int max_count) {
+    if (max_count < 5 || max_count > 99) return false;
+    atomic_store_explicit(&g_hotseat_max, max_count, memory_order_relaxed);
+    atomic_store_explicit(&g_hotseat_enabled, true, memory_order_release);
+    LOGI("hotseat requested: max=%d", max_count);
+    return find_and_install_if_loaded();
+}
+
+static bool configure_grid(int cell_x, int cell_y) {
+    if (cell_x < 3 || cell_x > 9 || cell_y < 4 || cell_y > 13) return false;
+    atomic_store_explicit(&g_cell_x, cell_x, memory_order_relaxed);
+    atomic_store_explicit(&g_cell_y, cell_y, memory_order_relaxed);
+    atomic_store_explicit(&g_grid_enabled, true, memory_order_release);
+    LOGI("grid requested: %dx%d", cell_x, cell_y);
+    return find_and_install_if_loaded();
+}
+
+static bool configure_icon_size(int icon_size) {
+    if (icon_size < 50 || icon_size > 360) return false;
+    atomic_store_explicit(&g_icon_size, icon_size, memory_order_relaxed);
+    atomic_store_explicit(&g_icon_enabled, true, memory_order_release);
+    LOGI("icon size requested: %d", icon_size);
+    return find_and_install_if_loaded();
 }
 
 JNIEXPORT jboolean JNICALL
@@ -266,7 +419,7 @@ Java_com_sevtinge_hyperceiler_libhook_utils_os4_Os4LauncherNativeBridge_nativePa
     JNIEnv *env, jclass clazz, jint max_count) {
     (void)env;
     (void)clazz;
-    return enqueue_patch(PATCH_HOTSEAT, (int)max_count, 0) ? JNI_TRUE : JNI_FALSE;
+    return configure_hotseat((int)max_count) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -274,7 +427,7 @@ Java_com_sevtinge_hyperceiler_libhook_utils_os4_Os4LauncherNativeBridge_nativePa
     JNIEnv *env, jclass clazz, jint cell_x, jint cell_y) {
     (void)env;
     (void)clazz;
-    return enqueue_patch(PATCH_GRID, (int)cell_x, (int)cell_y) ? JNI_TRUE : JNI_FALSE;
+    return configure_grid((int)cell_x, (int)cell_y) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
@@ -282,5 +435,13 @@ Java_com_sevtinge_hyperceiler_libhook_utils_os4_Os4LauncherNativeBridge_nativePa
     JNIEnv *env, jclass clazz, jint icon_size) {
     (void)env;
     (void)clazz;
-    return enqueue_patch(PATCH_ICON_SIZE, (int)icon_size, 0) ? JNI_TRUE : JNI_FALSE;
+    return configure_icon_size((int)icon_size) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_sevtinge_hyperceiler_libhook_utils_os4_Os4LauncherNativeBridge_nativeGetStatus(
+    JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    return (jint)atomic_load_explicit(&g_status, memory_order_acquire);
 }
