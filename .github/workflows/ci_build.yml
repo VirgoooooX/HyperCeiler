@@ -40,6 +40,9 @@ jobs:
       )
     runs-on: macos-latest
     name: Build App
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout Git Repository
         uses: actions/checkout@v6
@@ -69,6 +72,13 @@ jobs:
           echo ${{ secrets.SIGNING_KEY }} | base64 --decode > key.jks
           echo "GIT_ACTOR=${{ secrets.GIT_ACTOR }}" >> $GITHUB_ENV
           echo "GIT_TOKEN=${{ secrets.GIT_TOKEN }}" >> $GITHUB_ENV
+
+      - name: Provide GitHub Packages credentials
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          echo "GIT_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
+          echo "GIT_TOKEN=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
 
       - name: Build with Gradle (Canary)
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -325,6 +335,7 @@ jobs:
 
   push_to_debug_group:
     if: |
+      github.repository == 'ReChronoRain/HyperCeiler' &&
       github.event_name == 'pull_request' &&
       (
         startsWith(github.event.head_commit.message, 'app: update version ')
