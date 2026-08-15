@@ -43,7 +43,7 @@ import com.sevtinge.hyperceiler.settings.SettingsFragment;
 import com.sevtinge.hyperceiler.settings.SettingsPageFragment;
 import com.sevtinge.hyperceiler.utils.NoticeProcessor;
 import com.sevtinge.hyperceiler.utils.PersistConfig;
-import com.sevtinge.hyperceiler.utils.os4.Os4LauncherRootPatcher;
+import com.sevtinge.hyperceiler.utils.os4.Os4LauncherRootPatcherSafe;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -93,7 +93,7 @@ public class HomePageActivity extends AppCompatActivity
             // the normal Zygote/ART path. Keep the launcher-specific root
             // patcher app-side instead of depending on an LSPosed Java entry
             // inside the Flutter/Rust launcher process.
-            Os4LauncherRootPatcher.initialize();
+            Os4LauncherRootPatcherSafe.initialize();
         }
         setContentView(R.layout.activity_home);
         setupNavigation();
