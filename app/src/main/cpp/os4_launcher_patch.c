@@ -27,6 +27,7 @@ static const uintptr_t kRvaHotseatMaxCount = 0x008F0500u;
 static const uintptr_t kRvaCellCountXMax    = 0x0095CA90u;
 static const uintptr_t kRvaCellCountXMin    = 0x00978264u;
 static const uintptr_t kRvaCellCountXDef    = 0x009A7CF8u;
+static const uintptr_t kRvaIconSize         = 0x009AA734u;
 static const uintptr_t kRvaCellCountYDef    = 0x00B57280u;
 
 static const uint8_t kExpectedHotseatPrologue[8] = {
@@ -35,10 +36,16 @@ static const uint8_t kExpectedHotseatPrologue[8] = {
 static const uint8_t kExpectedConfigGetterPrologue[8] = {
     0x22, 0xf0, 0x41, 0xb8, 0x42, 0x80, 0x1c, 0x8b,
 };
+static const uint8_t kExpectedIconSizePrologue[12] = {
+    0xfd, 0x79, 0xbf, 0xa9,
+    0xfd, 0x03, 0x0f, 0xaa,
+    0xef, 0x81, 0x00, 0xd1,
+};
 
 enum PatchKind {
     PATCH_HOTSEAT = 1,
     PATCH_GRID = 2,
+    PATCH_ICON_SIZE = 3,
 };
 
 struct PatchRequest {
@@ -108,10 +115,46 @@ static int find_libapp_callback(struct dl_phdr_info *info, size_t size, void *da
     return 1;
 }
 
+static bool patch_code(
+    uintptr_t address,
+    const void *desired,
+    const void *expected,
+    size_t length
+) {
+    if (length == 0) return false;
+    if (memcmp((const void *)address, desired, length) == 0) return true;
+    if (memcmp((const void *)address, expected, length) != 0) return false;
+
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) return false;
+    const uintptr_t page_size = (uintptr_t)page_size_long;
+    const uintptr_t first_page = address & ~(page_size - 1u);
+    const uintptr_t end = address + length;
+    const uintptr_t last_page_end = (end + page_size - 1u) & ~(page_size - 1u);
+    const size_t protect_length = (size_t)(last_page_end - first_page);
+
+    if (mprotect(
+            (void *)first_page,
+            protect_length,
+            PROT_READ | PROT_WRITE | PROT_EXEC
+        ) != 0) {
+        return false;
+    }
+
+    memcpy((void *)address, desired, length);
+    __builtin___clear_cache((char *)address, (char *)(address + length));
+    return mprotect((void *)first_page, protect_length, PROT_READ | PROT_EXEC) == 0;
+}
+
 /* DeviceConfig.hotSeatMaxCount returns an unboxed native int in X0. */
 static uint32_t movz_x0_int(int value) {
     const uint32_t imm = (uint32_t)value & 0xffffu;
     return 0xD2800000u | (imm << 5u); /* MOVZ X0, #imm16 */
+}
+
+static uint32_t movz_w0_int(int value) {
+    const uint32_t imm = (uint32_t)value & 0xffffu;
+    return 0x52800000u | (imm << 5u); /* MOVZ W0, #imm16 */
 }
 
 static bool patch_encoded_return(uintptr_t address, uint32_t encoded_value, const uint8_t expected[8]) {
@@ -119,19 +162,7 @@ static bool patch_encoded_return(uintptr_t address, uint32_t encoded_value, cons
         movz_x0_int((int)encoded_value),
         0xD65F03C0u, /* RET */
     };
-
-    if (memcmp((const void *)address, desired, sizeof(desired)) == 0) return true;
-    if (memcmp((const void *)address, expected, sizeof(desired)) != 0) return false;
-
-    const long page_size_long = sysconf(_SC_PAGESIZE);
-    if (page_size_long <= 0) return false;
-    const uintptr_t page_size = (uintptr_t)page_size_long;
-    const uintptr_t page = address & ~(page_size - 1u);
-
-    if (mprotect((void *)page, page_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-    memcpy((void *)address, desired, sizeof(desired));
-    __builtin___clear_cache((char *)address, (char *)(address + sizeof(desired)));
-    return mprotect((void *)page, page_size, PROT_READ | PROT_EXEC) == 0;
+    return patch_code(address, desired, expected, sizeof(desired));
 }
 
 static uint32_t dart_smi(int value) {
@@ -162,6 +193,30 @@ static bool apply_grid_patch(uintptr_t base, int cell_x, int cell_y) {
     return ok;
 }
 
+static bool apply_icon_size_patch(uintptr_t base, int icon_size) {
+    if (icon_size < 50 || icon_size > 360) return false;
+
+    /*
+     * _IconConfig.getIconSize returns an unboxed double in D0. HyperCeiler's
+     * existing preference is a pixel-like integer (50..360), so convert the
+     * immediate W0 value to double and return it directly:
+     *   mov   w0, #icon_size
+     *   scvtf d0, w0
+     *   ret
+     */
+    const uint32_t desired[3] = {
+        movz_w0_int(icon_size),
+        0x1E620000u, /* SCVTF D0, W0 */
+        0xD65F03C0u, /* RET */
+    };
+    return patch_code(
+        base + kRvaIconSize,
+        desired,
+        kExpectedIconSizePrologue,
+        sizeof(desired)
+    );
+}
+
 static void *patch_worker(void *opaque) {
     struct PatchRequest *request = (struct PatchRequest *)opaque;
 
@@ -176,6 +231,8 @@ static void *patch_worker(void *opaque) {
                     (void)apply_hotseat_patch(result.base, request->first);
                 } else if (request->kind == PATCH_GRID) {
                     (void)apply_grid_patch(result.base, request->first, request->second);
+                } else if (request->kind == PATCH_ICON_SIZE) {
+                    (void)apply_icon_size_patch(result.base, request->first);
                 }
             }
             free(request);
@@ -218,4 +275,12 @@ Java_com_sevtinge_hyperceiler_libhook_utils_os4_Os4LauncherNativeBridge_nativePa
     (void)env;
     (void)clazz;
     return enqueue_patch(PATCH_GRID, (int)cell_x, (int)cell_y) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_sevtinge_hyperceiler_libhook_utils_os4_Os4LauncherNativeBridge_nativePatchIconSize(
+    JNIEnv *env, jclass clazz, jint icon_size) {
+    (void)env;
+    (void)clazz;
+    return enqueue_patch(PATCH_ICON_SIZE, (int)icon_size, 0) ? JNI_TRUE : JNI_FALSE;
 }
