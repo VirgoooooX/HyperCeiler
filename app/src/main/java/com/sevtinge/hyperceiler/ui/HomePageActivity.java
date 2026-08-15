@@ -81,7 +81,7 @@ public class HomePageActivity extends AppCompatActivity
             finish();
             return;
         }
-        if (!isVersionListed()) {
+        if (!isVersionListed() && !isExperimentalAndroid17HyperOS4()) {
             showUnsupportedVersionDialog();
             return;
         }
@@ -206,6 +206,16 @@ public class HomePageActivity extends AppCompatActivity
     @Override
     public void onDestroy() {
         super.onDestroy();
+    }
+
+    /**
+     * Android 17 / HyperOS 4 is an experimental compatibility target in this fork.
+     * Keep the upstream allow-list strict for every other unknown platform, while
+     * allowing this branch's OS4 launcher implementation to be configured and tested.
+     */
+    private boolean isExperimentalAndroid17HyperOS4() {
+        float hyperOsVersion = getHyperOSVersion();
+        return getAndroidVersion() == 37 && hyperOsVersion >= 4.0f && hyperOsVersion < 5.0f;
     }
 
     private void showUnsupportedVersionDialog() {
