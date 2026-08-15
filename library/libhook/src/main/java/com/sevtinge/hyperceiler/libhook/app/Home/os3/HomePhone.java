@@ -6,7 +6,7 @@
  * published by the Free Software Foundation, either version 3 of the
  * License.
 
- * This program is distributed in the hope that it will be useful,
+ * HyperCeiler is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU Affero General Public License for more details.
@@ -105,6 +105,13 @@ public class HomePhone extends BaseLoad {
         int launcherVersion = AppsTool.getPackageVersionCode(BaseLoad.getTarget());
         boolean isOs4Launcher = launcherVersion >= 800000000 && launcherVersion < 900000000;
         initHook(new Os4LauncherCompat(), isOs4Launcher);
+        if (isOs4Launcher) {
+            // HyperOS 4 launcher 8.x is Flutter/Dart AOT and contains no app DEX.
+            // Do not initialize legacy Java launcher hooks against a target that no
+            // longer exposes their classes. OS4 support is intentionally limited to
+            // the features implemented in Os4LauncherCompat until each hook is ported.
+            return;
+        }
 
         boolean gesturesEnabled = PrefsBridge.getBoolean("home_gesture_enable");
         boolean hasCornerGestureAction = PrefsBridge.getInt("home_navigation_assist_left_slide_action", 0) > 0
