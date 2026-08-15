@@ -43,6 +43,7 @@ import com.sevtinge.hyperceiler.settings.SettingsFragment;
 import com.sevtinge.hyperceiler.settings.SettingsPageFragment;
 import com.sevtinge.hyperceiler.utils.NoticeProcessor;
 import com.sevtinge.hyperceiler.utils.PersistConfig;
+import com.sevtinge.hyperceiler.utils.os4.Os4LauncherRootPatcher;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -87,6 +88,13 @@ public class HomePageActivity extends AppCompatActivity
         }
         // Activity 启动阶段，绑定 UI 任务（如签名校验弹窗、公告展示）
         AppInitializer.initOnActivityCreate(this, this);
+        if (isExperimentalAndroid17HyperOS4()) {
+            // HyperOS 4 starts com.miui.home through hyos_spawner rather than
+            // the normal Zygote/ART path. Keep the launcher-specific root
+            // patcher app-side instead of depending on an LSPosed Java entry
+            // inside the Flutter/Rust launcher process.
+            Os4LauncherRootPatcher.initialize();
+        }
         setContentView(R.layout.activity_home);
         setupNavigation();
         restoreCurrentPage(savedInstanceState);
