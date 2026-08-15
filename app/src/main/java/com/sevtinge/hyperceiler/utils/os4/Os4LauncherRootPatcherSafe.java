@@ -160,13 +160,25 @@ public final class Os4LauncherRootPatcherSafe {
         int cellY,
         String helperLibrary
     ) {
-        StringBuilder sh = new StringBuilder(daemon.length() + 4096);
+        StringBuilder sh = new StringBuilder(daemon.length() + 6144);
         sh.append("SCRIPT=").append(shellQuote(DAEMON_PATH)).append('\n');
         sh.append("PIDFILE=").append(shellQuote(PID_PATH)).append('\n');
         sh.append("LOGFILE=").append(shellQuote(LOG_PATH)).append('\n');
+
+        // A failed/older controller can leave an orphan watcher whose PID is no
+        // longer recorded in PIDFILE. Kill every old watcher by cmdline before
+        // writing the new configuration so two generations cannot race and
+        // continuously overwrite each other's in-memory return stubs.
+        sh.append("for proc in /proc/[0-9]*; do\n");
+        sh.append("  [ -r \"$proc/cmdline\" ] || continue\n");
+        sh.append("  p=${proc#/proc/}\n");
+        sh.append("  [ \"$p\" = \"$$\" ] && continue\n");
+        sh.append("  cmd=$(tr '\\000' ' ' < \"$proc/cmdline\" 2>/dev/null)\n");
+        sh.append("  case \"$cmd\" in *hyperceiler_os4_patcher.sh*) kill \"$p\" 2>/dev/null ;; esac\n");
+        sh.append("done\n");
         sh.append("if [ -s \"$PIDFILE\" ]; then old=$(cat \"$PIDFILE\" 2>/dev/null); [ -n \"$old\" ] && kill \"$old\" 2>/dev/null; fi\n");
         sh.append("rm -f \"$PIDFILE\"\n");
-        sh.append("sleep 0.08\n");
+        sh.append("sleep 0.12\n");
 
         if (gridEnabled) {
             sh.append("update_grid_file(){\n");
