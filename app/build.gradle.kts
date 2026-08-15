@@ -112,7 +112,7 @@ android {
             if (properties != null) {
                 storeFile = file(getString("storeFile", "STORE_FILE", "Store file"))
                 storePassword = getString("storePassword", "STORE_PASSWORD", "Store password")
-                keyAlias = getString("keyAlias", "KEY_ALIAS", "Key alias")
+                keyAlias = getString("keyAlias", "ALIAS", "Key alias")
                 keyPassword = getString("keyPassword", "KEY_PASSWORD", "Key password")
             }
             enableV1Signing = true
@@ -165,6 +165,11 @@ android {
         }
     }
 
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
 }
 
 afterEvaluate {
