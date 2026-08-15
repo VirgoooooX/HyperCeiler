@@ -45,6 +45,11 @@ public final class Os4LauncherNativeBridge {
         return ensureLoaded() && nativePatchGrid(cellX, cellY);
     }
 
+    public static boolean patchIconSize(int iconSize) {
+        return ensureLoaded() && nativePatchIconSize(iconSize);
+    }
+
     private static native boolean nativePatchHotseat(int maxCount);
     private static native boolean nativePatchGrid(int cellX, int cellY);
+    private static native boolean nativePatchIconSize(int iconSize);
 }
