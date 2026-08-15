@@ -37,27 +37,58 @@ class Os4LauncherCompat : HomeBaseHookNew() {
         val cellY = PrefsBridge.getInt("home_layout_unlock_grids_cell_y", 6).coerceIn(4, 13)
         val iconSize = PrefsBridge.getInt("home_title_icon_size", 182).coerceIn(50, 360)
 
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "OS4 entry: hotseat=$unlockHotseat grid=$unlockGrid iconSize=$customizeIconSize " +
+                "cell=${cellX}x${cellY} iconPx=$iconSize"
+        )
+
         if (unlockHotseat) {
             if (Os4LauncherNativeBridge.patchHotseat(99)) {
-                XposedLog.i(TAG, lpparam.packageName, "OS4: scheduled hotseat max-count patch")
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "OS4: configured hotseat max-count; native=${Os4LauncherNativeBridge.statusHex()}"
+                )
             } else {
-                XposedLog.e(TAG, lpparam.packageName, "OS4: failed to load/schedule hotseat native patch")
+                XposedLog.e(
+                    TAG,
+                    lpparam.packageName,
+                    "OS4: failed hotseat native setup; native=${Os4LauncherNativeBridge.statusHex()}"
+                )
             }
         }
 
         if (unlockGrid) {
             if (Os4LauncherNativeBridge.patchGrid(cellX, cellY)) {
-                XposedLog.i(TAG, lpparam.packageName, "OS4: scheduled grid patch ${cellX}x${cellY}")
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "OS4: configured grid ${cellX}x${cellY}; native=${Os4LauncherNativeBridge.statusHex()}"
+                )
             } else {
-                XposedLog.e(TAG, lpparam.packageName, "OS4: failed to load/schedule grid native patch")
+                XposedLog.e(
+                    TAG,
+                    lpparam.packageName,
+                    "OS4: failed grid native setup; native=${Os4LauncherNativeBridge.statusHex()}"
+                )
             }
         }
 
         if (customizeIconSize) {
             if (Os4LauncherNativeBridge.patchIconSize(iconSize)) {
-                XposedLog.i(TAG, lpparam.packageName, "OS4: scheduled icon-size patch $iconSize")
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "OS4: configured icon size $iconSize; native=${Os4LauncherNativeBridge.statusHex()}"
+                )
             } else {
-                XposedLog.e(TAG, lpparam.packageName, "OS4: failed to load/schedule icon-size native patch")
+                XposedLog.e(
+                    TAG,
+                    lpparam.packageName,
+                    "OS4: failed icon-size native setup; native=${Os4LauncherNativeBridge.statusHex()}"
+                )
             }
         }
 
@@ -73,6 +104,11 @@ class Os4LauncherCompat : HomeBaseHookNew() {
                 override fun before(param: HookParam) {
                     val context = param.args[0] as? Context ?: return
                     applyGridPreferences(context, unlockGrid, cellX, cellY)
+                    XposedLog.i(
+                        TAG,
+                        lpparam.packageName,
+                        "OS4 Application.attach: grid prefs applied; native=${Os4LauncherNativeBridge.statusHex()}"
+                    )
                 }
             }
         )
@@ -80,6 +116,11 @@ class Os4LauncherCompat : HomeBaseHookNew() {
         // Also cover module hot-reload where Application.attach already ran.
         ContextUtils.getContextNoError(ContextUtils.FLAG_CURRENT_APP)?.let {
             applyGridPreferences(it, unlockGrid, cellX, cellY)
+            XposedLog.i(
+                TAG,
+                lpparam.packageName,
+                "OS4 current app context available; native=${Os4LauncherNativeBridge.statusHex()}"
+            )
         }
 
         if (PrefsBridge.getBoolean("home_layout_workspace_padding_bottom_enable") ||
@@ -116,7 +157,9 @@ class Os4LauncherCompat : HomeBaseHookNew() {
                 .putInt(KEY_CELL_X, cellX)
                 .putInt(KEY_CELL_Y, cellY)
                 .commit()
-            if (!committed) {
+            if (committed) {
+                XposedLog.i(TAG, lpparam.packageName, "OS4: persisted launcher grid ${cellX}x${cellY}")
+            } else {
                 XposedLog.w(TAG, lpparam.packageName, "OS4: failed to persist custom launcher grid")
             }
             return
@@ -142,7 +185,9 @@ class Os4LauncherCompat : HomeBaseHookNew() {
             .remove(BACKUP_CELL_X)
             .remove(BACKUP_CELL_Y)
             .commit()
-        if (!committed) {
+        if (committed) {
+            XposedLog.i(TAG, lpparam.packageName, "OS4: restored original launcher grid preferences")
+        } else {
             XposedLog.w(TAG, lpparam.packageName, "OS4: failed to restore original launcher grid")
         }
     }
