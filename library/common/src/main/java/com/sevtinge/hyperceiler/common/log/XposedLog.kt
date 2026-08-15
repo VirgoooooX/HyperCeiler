@@ -8,6 +8,7 @@ import io.github.libxposed.api.XposedInterface
  */
 object XposedLog {
     private const val TAG = "HyperCeiler"
+    private const val DUAL_ROW_LOGCAT_TAG = "DualRowSignal"
 
     @Volatile
     private var sXposed: XposedInterface? = null
@@ -22,6 +23,17 @@ object XposedLog {
         val xposed = sXposed
         if (xposed != null) {
             xposed.log(priority, TAG, msg, t)
+
+            // Dual-row signal adaptation is currently being validated on
+            // HyperOS 4 / API 37. Mirror only its diagnostics to Android's
+            // logcat so runtime failures can be collected with adb without
+            // exporting the complete LSPosed module log.
+            if (msg.contains("DualRowSignal", ignoreCase = true)) {
+                Log.println(priority, DUAL_ROW_LOGCAT_TAG, msg)
+                t?.let {
+                    Log.println(priority, DUAL_ROW_LOGCAT_TAG, Log.getStackTraceString(it))
+                }
+            }
         } else {
             Log.println(priority, TAG, msg)
             t?.let { Log.println(priority, TAG, Log.getStackTraceString(it)) }
