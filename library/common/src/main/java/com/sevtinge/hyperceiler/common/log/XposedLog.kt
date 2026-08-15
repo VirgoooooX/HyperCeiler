@@ -80,10 +80,6 @@ object XposedLog {
         if (xposed != null) {
             xposed.log(priority, TAG, msg, t)
 
-            // Dual-row signal adaptation is currently being validated on
-            // HyperOS 4 / API 37. Mirror only its diagnostics to Android's
-            // logcat so runtime failures can be collected with adb without
-            // exporting the complete LSPosed module log.
             if (msg.contains("DualRowSignal", ignoreCase = true)) {
                 Log.println(priority, DUAL_ROW_LOGCAT_TAG, msg)
                 t?.let {
@@ -108,7 +104,6 @@ object XposedLog {
         return LoggerUtils.shouldLog(LogStatusManager.getLogLevel(), requiredLevel)
     }
 
-    // --- Full logs: 2 ---
     @JvmStatic
     fun d(msg: String) {
         if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(msg = msg)) return
@@ -134,7 +129,6 @@ object XposedLog {
         logRaw(Log.DEBUG, LoggerUtils.formatBrackets(pkg, tag, msg))
     }
 
-    // --- Full logs: 2 ---
     @JvmStatic
     fun i(msg: String) {
         if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(msg = msg)) return
@@ -154,7 +148,6 @@ object XposedLog {
         logRaw(Log.INFO, LoggerUtils.formatBrackets(pkg, tag, msg))
     }
 
-    // --- Full logs: 2 ---
     @JvmStatic
     fun w(msg: String) {
         if (!shouldLog(LogLevelManager.LEVEL_VERBOSE) && !isDualRowDiagnostic(msg = msg)) return
@@ -187,42 +180,42 @@ object XposedLog {
         logRaw(Log.WARN, LoggerUtils.formatBrackets(pkg, tag, msg), t)
     }
 
-    // --- Error only: 1 ---
     @JvmStatic
     fun e(msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY)) return
+        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY) && !isDualRowDiagnostic(msg = msg)) return
         logRaw(Log.ERROR, msg)
     }
 
     @JvmStatic
     fun e(tag: String, msg: String) {
-        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY)) return
+        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.ERROR, "[$tag]: $msg")
     }
 
     @JvmStatic
     fun e(tag: String, t: Throwable) {
-        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY)) return
-        logRaw(Log.ERROR, "[$tag]: ${t.message ?: t.toString()}", t)
+        val msg = t.message ?: t.toString()
+        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY) && !isDualRowDiagnostic(tag, msg)) return
+        logRaw(Log.ERROR, "[$tag]: $msg", t)
     }
 
     @JvmStatic
     fun e(tag: String, msg: String, t: Throwable) {
-        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY)) return
+        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.ERROR, "[$tag]: $msg", t)
     }
 
     @JvmStatic
     fun e(tag: String, pkg: String?, msg: String) {
         probeDualRowGate(pkg)
-        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY)) return
+        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.ERROR, LoggerUtils.formatBrackets(pkg, tag, msg))
     }
 
     @JvmStatic
     fun e(tag: String, pkg: String?, msg: String, t: Throwable) {
         probeDualRowGate(pkg)
-        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY)) return
+        if (!shouldLog(LogLevelManager.LEVEL_ERROR_ONLY) && !isDualRowDiagnostic(tag, msg)) return
         logRaw(Log.ERROR, LoggerUtils.formatBrackets(pkg, tag, msg), t)
     }
 
