@@ -28,7 +28,7 @@ import io.github.lingqiqi5211.ezhooktool.xposed.common.HookParam;
 
 public class IconSize extends HomeBaseHookNew {
 
-    @Version(isPad = false, min = 600000000)
+    @Version(isPad = false, min = 600000000, max = 799999999)
     private void initOS3Hook() {
         findAndHookMethod("com.miui.home.common.gridconfig.GridConfig$IconConfig", "getIconSize", new IMethodHook() {
                 @Override
@@ -36,6 +36,11 @@ public class IconSize extends HomeBaseHookNew {
                 param.setResult(PrefsBridge.getInt("home_title_icon_size", 182));
             }
         });
+    }
+
+    @Version(isPad = false, min = 800000000, max = 899999999)
+    private void initOS4Hook() {
+        // Flutter/Dart launcher: handled by Os4LauncherCompat + native libapp.so patch.
     }
 
     @Override
