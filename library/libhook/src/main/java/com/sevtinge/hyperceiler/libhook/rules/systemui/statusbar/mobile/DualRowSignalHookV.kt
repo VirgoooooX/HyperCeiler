@@ -5,16 +5,6 @@
  * it under the terms of the GNU Affero General Public License as
  * published by the Free Software Foundation, either version 3 of the
  * License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
- * Copyright (C) 2023-2026 HyperCeiler Contributions
  */
 package com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.mobile
 
@@ -33,7 +23,6 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
 import androidx.core.graphics.createBitmap
-import androidx.core.util.size
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.common.utils.api.ProjectApi
@@ -50,8 +39,8 @@ import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createInterceptHook
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getBooleanField
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getIntField
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getObjectField
-import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getObjectFieldAs
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DualRowSignalHookV : MobileSignalHook() {
     private val ID_DUAL_CONTAINER by lazy { getOrCreateViewId("dual_signal_container") }
@@ -70,7 +59,6 @@ class DualRowSignalHookV : MobileSignalHook() {
     private val verticalOffset by lazy {
         PrefsBridge.getInt("system_ui_statusbar_mobile_network_icon_vertical_offset", 40)
     }
-
     private val selectedIconStyle by lazy {
         PrefsBridge.getString("system_ui_status_mobile_network_icon_style", "")
     }
@@ -79,18 +67,17 @@ class DualRowSignalHookV : MobileSignalHook() {
     private val simSignalLevels = ConcurrentHashMap<Int, Int>()
     private val simDataSimState = ConcurrentHashMap<Int, Boolean>()
     private val simSlotIndices = ConcurrentHashMap<Int, Int>()
+    private val activeSubIds = ConcurrentHashMap.newKeySet<Int>()
     private val missingViewWarnings = ConcurrentHashMap.newKeySet<String>()
     private val pendingViewLogs = ConcurrentHashMap.newKeySet<Int>()
     private val attachRefreshRegistered = ConcurrentHashMap.newKeySet<Int>()
+    private val controllerFieldLogs = ConcurrentHashMap.newKeySet<String>()
+    private val renderSignatures = ConcurrentHashMap<Int, String>()
+    private val samplerStarted = AtomicBoolean(false)
 
     @Volatile
     private var networkControllerInstance: Any? = null
 
-    /**
-     * -1 means subscriptions have not been delivered by NetworkController yet.
-     * Once setCurrentSubscriptionsLocked runs, its argument becomes the primary
-     * source of truth instead of relying on a private controller field.
-     */
     @Volatile
     private var activeSubscriptionCount = -1
 
@@ -113,36 +100,19 @@ class DualRowSignalHookV : MobileSignalHook() {
         }
     }
 
-    // ==================== 视图创建 ====================
-
     private fun onViewCreated(rootView: ViewGroup, subId: Int) {
-        // Cache first. On HyperOS 4 the mobile view may be constructed before
-        // NetworkController has delivered its subscriptions. If we return before
-        // caching here, there is no view left for the later subscription update
-        // to rebuild.
         cacheTrackedView(subId, rootView)
-
         if (!ensureDualSignalContainer(rootView, subId)) return
 
-        if (simSignalLevels.isNotEmpty()) {
-            val dark = viewDarkState[System.identityHashCode(rootView)]
-            refreshDualIconsForView(
-                rootView,
-                dark?.isUseTint ?: false,
-                dark?.isLight ?: true,
-                dark?.color
-            )
-        }
+        val dark = viewDarkState[System.identityHashCode(rootView)]
+        refreshDualIconsForView(
+            rootView,
+            dark?.isUseTint ?: false,
+            dark?.isLight ?: true,
+            dark?.color
+        )
     }
 
-    /**
-     * Ensure a cached mobile view has the injected dual-row container.
-     *
-     * This method is intentionally idempotent because it is called both from
-     * constructAndBind and again after telephony/subscription state becomes
-     * available. This removes the old assumption that NetworkController was
-     * fully initialized before the status-bar view was created.
-     */
     private fun ensureDualSignalContainer(rootView: ViewGroup, subId: Int): Boolean {
         cacheTrackedView(subId, rootView)
 
@@ -170,27 +140,26 @@ class DualRowSignalHookV : MobileSignalHook() {
             warnMissingViewOnce(rootView, "mobile_signal_container")
             return false
         }
-        val mobileSignal = rootView.findById<View>("mobile_signal")
-        if (mobileSignal == null) {
+        if (rootView.findById<View>("mobile_signal") == null) {
             warnMissingViewOnce(rootView, "mobile_signal")
             return false
         }
 
         pendingViewLogs.remove(System.identityHashCode(rootView))
         ensureDualSignalResLoaded(rootView.context)
+        if (!dualSignalResLoaded) {
+            syncDualSignalVisibility(rootView, false)
+            return false
+        }
 
         mobileGroup.setPadding(
             DisplayUtils.dp2px(leftMargin * 0.5f), 0,
             DisplayUtils.dp2px(rightMargin * 0.5f), 0
         )
 
-        val existingContainer = rootView.findByViewId<FrameLayout>(ID_DUAL_CONTAINER)
-        if (existingContainer != null) {
-            syncDualSignalVisibility(rootView, true)
-            return true
-        }
+        val existing = rootView.findByViewId<FrameLayout>(ID_DUAL_CONTAINER)
+        if (existing != null) return true
 
-        // 双卡模式：为每个 View 都创建双排信号容器
         val context = rootView.context
         val dualContainer = FrameLayout(context).apply {
             id = ID_DUAL_CONTAINER
@@ -209,21 +178,19 @@ class DualRowSignalHookV : MobileSignalHook() {
             adjustViewBounds = true
         }
 
+        val signalHeight = if (iconScale != 100) {
+            DisplayUtils.dp2px(iconScale / 10 * 2.0f)
+        } else {
+            ViewGroup.LayoutParams.MATCH_PARENT
+        }
         val signalLp = ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
-            if (iconScale != 100) {
-                DisplayUtils.dp2px(iconScale / 10 * 2.0f)
-            } else {
-                ViewGroup.LayoutParams.MATCH_PARENT
-            }
+            signalHeight
         )
         dualContainer.addView(slot1, ViewGroup.LayoutParams(signalLp))
         dualContainer.addView(slot2, ViewGroup.LayoutParams(signalLp))
-
         signalContainer.addView(dualContainer)
 
-        // OS3 used ConstraintLayout here. Keep the reflection best-effort for
-        // that layout, but do not make it a prerequisite on OS4.
         val dualContainerId = ID_DUAL_CONTAINER
         runCatching {
             val dlp = dualContainer.layoutParams
@@ -233,9 +200,6 @@ class DualRowSignalHookV : MobileSignalHook() {
             dualContainer.layoutParams = dlp
         }
 
-        mobileSignal.visibility = View.GONE
-
-        // OS3: ConstraintLayout 约束修正；OS4 若布局参数不同则保持默认布局。
         (signalContainer.findViewByIdName("mobile_type") as? ImageView)?.let { mobileType ->
             runCatching {
                 val lp = mobileType.layoutParams
@@ -260,11 +224,14 @@ class DualRowSignalHookV : MobileSignalHook() {
                 DisplayUtils.dp2px((verticalOffset - 40) * 0.1f).toFloat()
         }
 
-        syncDualSignalVisibility(rootView, true)
+        // Keep the stock signal visible until the first dual-row frame is fully
+        // resolved. This prevents a blank status bar while OS4 controllers warm up.
+        syncDualSignalVisibility(rootView, false)
+
         XposedLog.i(
             TAG,
             lpparam.packageName,
-            "DualRowSignal: dual container created for subId=$subId activeSubscriptions=$activeCount root=${rootView.javaClass.name}"
+            "DualRowSignal: dual container created for subId=$subId activeSubscriptions=$activeCount root=${rootView.javaClass.name} resources=${dualSignalResMap.size}"
         )
 
         setDensityReplacement(
@@ -312,26 +279,17 @@ class DualRowSignalHookV : MobileSignalHook() {
         XposedLog.w(
             TAG,
             lpparam.packageName,
-            "DualRowSignal OS4 compatibility: required view '$idName' not found under ${rootView.javaClass.name}; dual-row container cannot be injected for this view"
+            "DualRowSignal OS4 compatibility: required view '$idName' not found under ${rootView.javaClass.name}"
         )
     }
 
-    // ==================== 反色处理 ====================
-
     private fun onDarkModeChanged(rootView: ViewGroup, darkInfo: DarkInfo) {
-        val subId = try {
-            getIntField(rootView, "subId")
-        } catch (_: Throwable) {
-            -1
-        }
+        val subId = runCatching { getIntField(rootView, "subId") }.getOrDefault(-1)
         if (subId == -1) return
 
         viewDarkState[System.identityHashCode(rootView)] = darkInfo
         cacheTrackedView(subId, rootView)
-
         if (!ensureDualSignalContainer(rootView, subId)) return
-        if (simSignalLevels.isEmpty()) return
-
         refreshDualIconsForView(
             rootView,
             darkInfo.isUseTint,
@@ -340,44 +298,18 @@ class DualRowSignalHookV : MobileSignalHook() {
         )
     }
 
-    // ==================== 活跃 SIM 数量查询 ====================
-
     private fun getActiveMobileControllerCount(): Int {
-        // setCurrentSubscriptionsLocked is the preferred source because it is
-        // already hooked and does not depend on an R8/private field name.
         val authoritativeCount = activeSubscriptionCount
         if (authoritativeCount >= 0) return authoritativeCount
 
-        // Before the subscription callback arrives, signal-controller callbacks
-        // can still provide useful slot information.
         val observedSlotCount = simSlotIndices.values
             .filter { it != SubscriptionManager.INVALID_SIM_SLOT_INDEX && it >= 0 }
             .toSet()
             .size
         if (observedSlotCount > 0) return observedSlotCount
 
-        val controller = networkControllerInstance ?: return 0
-
-        // OS4/API37 fallback: prefer the subscription list, then retain the old
-        // mMobileSignalControllers path for older builds.
-        val subscriptionCount = runCatching {
-            controller.getObjectFieldAs<List<*>>("mCurrentSubscriptions").count { it != null }
-        }.getOrNull()
-        if (subscriptionCount != null) return subscriptionCount
-
-        return runCatching {
-            controller.getObjectFieldAs<SparseArray<*>>("mMobileSignalControllers").size
-        }.getOrElse { e ->
-            XposedLog.w(
-                TAG,
-                lpparam.packageName,
-                "DualRowSignal: cannot resolve active subscription count from OS4 NetworkController: ${e.message}"
-            )
-            0
-        }
+        return collectMobileControllers().mapNotNull { it.first }.toSet().size
     }
-
-    // ==================== 资源加载 ====================
 
     private fun drawableToBitmap(drawable: Drawable): Bitmap {
         if (drawable is BitmapDrawable && drawable.bitmap != null) {
@@ -432,6 +364,11 @@ class DualRowSignalHookV : MobileSignalHook() {
             }
 
             dualSignalResLoaded = dualSignalResMap.isNotEmpty()
+            XposedLog.i(
+                TAG,
+                lpparam.packageName,
+                "DualRowSignal: resources loaded ok=$dualSignalResLoaded count=${dualSignalResMap.size} style='$selectedIconStyle'"
+            )
         }
     }
 
@@ -441,63 +378,16 @@ class DualRowSignalHookV : MobileSignalHook() {
                 val result = chain.proceed()
                 val signalController = chain.thisObject ?: return@createInterceptHook result
 
-                var controllerDiscovered = false
                 if (networkControllerInstance == null) {
-                    runCatching {
-                        signalController.getObjectField("mNetworkController")
-                    }.getOrNull()?.let { networkController ->
-                        networkControllerInstance = networkController
-                        controllerDiscovered = true
+                    readField(signalController, "mNetworkController")?.let { network ->
+                        networkControllerInstance = network
+                        startControllerSampler()
                     }
                 }
 
-                val subscriptionInfo = signalController.getObjectFieldAs<Any>("mSubscriptionInfo")
-                val subscriptionId = subscriptionInfo.callMethodAs<Int>("getSubscriptionId")
-                val slotIndex = runCatching {
-                    subscriptionInfo.callMethodAs<Int>("getSimSlotIndex")
-                }.getOrElse {
-                    SubscriptionManager.getSlotIndex(subscriptionId)
+                if (captureSignalController(signalController, "notifyListeners", null)) {
+                    refreshAllCachedViews()
                 }
-                val currentState = signalController.getObjectFieldAs<Any>("mCurrentState")
-
-                val dataSim = currentState.getBooleanField("dataSim")
-                val connected = currentState.getBooleanField("connected")
-                val enabled = runCatching {
-                    currentState.getBooleanField("enabled")
-                }.getOrDefault(true)
-                val signalStrength = currentState.getObjectField("signalStrength")
-                val rawLevel = if (!connected) {
-                    0
-                } else {
-                    runCatching {
-                        signalStrength?.callMethodAs<Int>("getMiuiLevel") ?: 0
-                    }.getOrElse {
-                        runCatching { currentState.getIntField("level") }.getOrDefault(0)
-                    }
-                }
-                val mappedLevel = if (rawLevel >= 2) rawLevel + 1 else rawLevel
-                val previousLevel = simSignalLevels[subscriptionId] ?: 0
-                val level = if (!connected && enabled && mappedLevel == 0 && previousLevel > 0) {
-                    previousLevel
-                } else {
-                    mappedLevel
-                }
-                val oldLevel = simSignalLevels.put(subscriptionId, level)
-                val oldDataSim = simDataSimState.put(subscriptionId, dataSim)
-                val oldSlotIndex = simSlotIndices.put(subscriptionId, slotIndex)
-
-                if (
-                    oldLevel == level &&
-                    oldDataSim == dataSim &&
-                    oldSlotIndex == slotIndex &&
-                    !controllerDiscovered
-                ) {
-                    return@createInterceptHook result
-                }
-
-                // This also creates a container for views that were cached before
-                // NetworkController/telephony initialization completed.
-                refreshAllCachedViews()
                 result
             }
 
@@ -508,30 +398,25 @@ class DualRowSignalHookV : MobileSignalHook() {
                 networkControllerInstance = networkCtrl
 
                 val subList = chain.args.getOrNull(0) as? List<*> ?: emptyList<Any>()
-                val newSubIds = subList.filterNotNull().mapNotNull { subInfo ->
-                    runCatching {
-                        subInfo.callMethodAs<Int>("getSubscriptionId")
-                    }.getOrNull()
-                }.toSet()
-                val newSlotIndices = subList.filterNotNull().associateNotNull { subInfo ->
+                val newSubIds = LinkedHashSet<Int>()
+                val newSlotIndices = LinkedHashMap<Int, Int>()
+                subList.filterNotNull().forEach { subInfo ->
                     val subId = runCatching {
                         subInfo.callMethodAs<Int>("getSubscriptionId")
-                    }.getOrNull()
+                    }.getOrNull() ?: return@forEach
+                    newSubIds += subId
                     val slot = runCatching {
                         subInfo.callMethodAs<Int>("getSimSlotIndex")
-                    }.getOrNull() ?: subId?.let { SubscriptionManager.getSlotIndex(it) }
-                    if (
-                        subId == null ||
-                        slot == null ||
-                        slot == SubscriptionManager.INVALID_SIM_SLOT_INDEX
-                    ) {
-                        null
-                    } else {
-                        subId to slot
+                    }.getOrElse {
+                        SubscriptionManager.getSlotIndex(subId)
+                    }
+                    if (slot != SubscriptionManager.INVALID_SIM_SLOT_INDEX && slot >= 0) {
+                        newSlotIndices[subId] = slot
                     }
                 }
 
-                val oldCount = activeSubscriptionCount
+                activeSubIds.clear()
+                activeSubIds.addAll(newSubIds)
                 val slotCount = newSlotIndices.values.toSet().size
                 activeSubscriptionCount = if (slotCount > 0) slotCount else newSubIds.size
 
@@ -540,58 +425,247 @@ class DualRowSignalHookV : MobileSignalHook() {
                     simDataSimState.clear()
                     simSlotIndices.clear()
                 } else {
-                    val staleKeys = simSignalLevels.keys.filter { it !in newSubIds }
-                    staleKeys.forEach { key ->
-                        val staleLevel = simSignalLevels[key]
-                        val staleSlot = simSlotIndices[key]
-                        val replacementSubId = staleSlot?.let { slot ->
-                            newSlotIndices.entries.firstOrNull { (subId, newSlot) ->
-                                newSlot == slot && subId != key
-                            }?.key
-                        }
-                        if (
-                            replacementSubId != null &&
-                            staleLevel != null &&
-                            staleLevel > 0
-                        ) {
-                            val currentReplacementLevel =
-                                simSignalLevels[replacementSubId] ?: 0
-                            if (currentReplacementLevel <= 0) {
-                                simSignalLevels[replacementSubId] = staleLevel
-                                simDataSimState[replacementSubId] =
-                                    simDataSimState[key] == true
-                                staleSlot.let {
-                                    simSlotIndices[replacementSubId] = it
-                                }
-                            }
-                        }
-                        simSignalLevels.remove(key)
-                        simDataSimState.remove(key)
-                        simSlotIndices.remove(key)
+                    simSignalLevels.keys.filter { it !in newSubIds }.forEach {
+                        simSignalLevels.remove(it)
+                        simDataSimState.remove(it)
+                        simSlotIndices.remove(it)
+                    }
+                    newSubIds.forEach { subId ->
+                        // Seed both rows immediately. OS4's modern pipeline may no
+                        // longer invoke MobileSignalController.notifyListeners.
+                        simSignalLevels.putIfAbsent(subId, 0)
+                        simDataSimState.putIfAbsent(
+                            subId,
+                            subId == SubscriptionManager.getDefaultDataSubscriptionId()
+                        )
+                        newSlotIndices[subId]?.let { simSlotIndices[subId] = it }
                     }
                 }
 
-                if (oldCount != activeSubscriptionCount) {
-                    XposedLog.i(
-                        TAG,
-                        lpparam.packageName,
-                        "DualRowSignal: subscriptions updated count=$activeSubscriptionCount ids=$newSubIds slots=$newSlotIndices"
-                    )
-                }
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "DualRowSignal: subscriptions updated count=$activeSubscriptionCount ids=$newSubIds slots=$newSlotIndices"
+                )
 
-                // Critical for OS4: views may already exist but have no injected
-                // container yet. The refresh path now calls ensure first.
+                startControllerSampler()
+                pollControllersOnce("subscriptions")
                 refreshAllCachedViews()
                 result
             }
     }
 
-    // ==================== 视图刷新 ====================
+    private fun startControllerSampler() {
+        if (!samplerStarted.compareAndSet(false, true)) return
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "DualRowSignal: OS4 controller sampler started"
+        )
+        mainHandler.post(controllerPollRunnable)
+    }
+
+    private val controllerPollRunnable = object : Runnable {
+        override fun run() {
+            pollControllersOnce("poll")
+            // Re-assert our visibility/layout even when the level did not change;
+            // MiuiMobileIconBinder can rebind the stock ImageView asynchronously.
+            if (activeSubscriptionCount > 1) refreshAllCachedViews()
+            mainHandler.postDelayed(this, 750L)
+        }
+    }
+
+    private fun pollControllersOnce(source: String): Boolean {
+        var changed = false
+        val controllers = collectMobileControllers()
+        controllers.forEach { (hintedSubId, controller) ->
+            changed = captureSignalController(controller, source, hintedSubId) || changed
+        }
+        return changed
+    }
+
+    private fun collectMobileControllers(): List<Pair<Int?, Any>> {
+        val network = networkControllerInstance ?: return emptyList()
+        val result = ArrayList<Pair<Int?, Any>>(4)
+        val seen = HashSet<Int>()
+
+        fun appendCandidate(fieldName: String, value: Any?) {
+            when (value) {
+                is SparseArray<*> -> {
+                    for (i in 0 until value.size()) {
+                        val item = value.valueAt(i) ?: continue
+                        if (!looksLikeSignalController(item)) continue
+                        val identity = System.identityHashCode(item)
+                        if (!seen.add(identity)) continue
+                        result += value.keyAt(i) to item
+                    }
+                    if (result.isNotEmpty() && controllerFieldLogs.add(fieldName)) {
+                        XposedLog.i(
+                            TAG,
+                            lpparam.packageName,
+                            "DualRowSignal: controller source field=$fieldName type=SparseArray size=${value.size()}"
+                        )
+                    }
+                }
+
+                is Map<*, *> -> {
+                    value.forEach { (key, item) ->
+                        item ?: return@forEach
+                        if (!looksLikeSignalController(item)) return@forEach
+                        val identity = System.identityHashCode(item)
+                        if (!seen.add(identity)) return@forEach
+                        result += (key as? Int) to item
+                    }
+                    if (result.isNotEmpty() && controllerFieldLogs.add(fieldName)) {
+                        XposedLog.i(
+                            TAG,
+                            lpparam.packageName,
+                            "DualRowSignal: controller source field=$fieldName type=Map size=${value.size}"
+                        )
+                    }
+                }
+            }
+        }
+
+        appendCandidate("mMobileSignalControllers", readField(network, "mMobileSignalControllers"))
+        if (result.isNotEmpty()) return result
+
+        forEachField(network) { fieldName, value ->
+            appendCandidate(fieldName, value)
+        }
+
+        if (result.isEmpty() && controllerFieldLogs.add("<missing>")) {
+            XposedLog.w(
+                TAG,
+                lpparam.packageName,
+                "DualRowSignal: no MobileSignalController collection found on ${network.javaClass.name}; keeping stock signal until controller data is available"
+            )
+        }
+        return result
+    }
+
+    private fun looksLikeSignalController(instance: Any): Boolean {
+        val name = instance.javaClass.name
+        if (name.contains("MobileSignalController")) return true
+        return findField(instance.javaClass, "mCurrentState") != null
+    }
+
+    private fun captureSignalController(
+        signalController: Any,
+        source: String,
+        hintedSubId: Int?
+    ): Boolean {
+        val subscriptionInfo = readField(signalController, "mSubscriptionInfo")
+        val subscriptionId = runCatching {
+            subscriptionInfo?.callMethodAs<Int>("getSubscriptionId")
+        }.getOrNull() ?: hintedSubId ?: return false
+
+        val slotIndex = runCatching {
+            subscriptionInfo?.callMethodAs<Int>("getSimSlotIndex")
+        }.getOrNull()?.takeIf {
+            it != SubscriptionManager.INVALID_SIM_SLOT_INDEX && it >= 0
+        } ?: simSlotIndices[subscriptionId]
+        ?: SubscriptionManager.getSlotIndex(subscriptionId)
+
+        val currentState = readField(signalController, "mCurrentState")
+            ?: readField(signalController, "mLastState")
+            ?: return false
+
+        val dataSim = runCatching {
+            currentState.getBooleanField("dataSim")
+        }.getOrElse {
+            subscriptionId == SubscriptionManager.getDefaultDataSubscriptionId()
+        }
+        val enabled = runCatching {
+            currentState.getBooleanField("enabled")
+        }.getOrDefault(true)
+        val connected = runCatching {
+            currentState.getBooleanField("connected")
+        }.getOrNull()
+
+        val signalStrength = readField(currentState, "signalStrength")
+        val miuiLevel = runCatching {
+            signalStrength?.callMethodAs<Int>("getMiuiLevel")
+        }.getOrNull()
+        val androidLevel = runCatching {
+            signalStrength?.callMethodAs<Int>("getLevel")
+        }.getOrNull()
+        val stateLevel = runCatching {
+            currentState.getIntField("level")
+        }.getOrNull()
+        val alternateLevel = runCatching {
+            currentState.getIntField("signalLevel")
+        }.getOrNull()
+
+        val rawLevel = listOfNotNull(miuiLevel, stateLevel, androidLevel, alternateLevel)
+            .firstOrNull { it >= 0 }
+            ?: 0
+        val mappedLevel = (if (rawLevel >= 2) rawLevel + 1 else rawLevel).coerceIn(0, 5)
+        val previousLevel = simSignalLevels[subscriptionId] ?: 0
+        val level = if (connected == false && enabled && mappedLevel == 0 && previousLevel > 0) {
+            previousLevel
+        } else {
+            mappedLevel
+        }
+
+        val oldLevel = simSignalLevels.put(subscriptionId, level)
+        val oldDataSim = simDataSimState.put(subscriptionId, dataSim)
+        val oldSlotIndex = simSlotIndices.put(subscriptionId, slotIndex)
+        val changed = oldLevel != level || oldDataSim != dataSim || oldSlotIndex != slotIndex
+
+        if (changed) {
+            XposedLog.i(
+                TAG,
+                lpparam.packageName,
+                "DualRowSignal: signal captured subId=$subscriptionId slot=$slotIndex raw=$rawLevel level=$level connected=$connected dataSim=$dataSim source=$source controller=${signalController.javaClass.name}"
+            )
+        }
+        return changed
+    }
+
+    private fun findField(clazz: Class<*>, name: String): java.lang.reflect.Field? {
+        var current: Class<*>? = clazz
+        while (current != null) {
+            val cls = current
+            val field = runCatching { cls.getDeclaredField(name) }.getOrNull()
+            if (field != null) return field
+            current = cls.superclass
+        }
+        return null
+    }
+
+    private fun readField(instance: Any, name: String): Any? {
+        val field = findField(instance.javaClass, name) ?: return null
+        return runCatching {
+            field.isAccessible = true
+            field.get(instance)
+        }.getOrNull()
+    }
+
+    private inline fun forEachField(instance: Any, block: (String, Any?) -> Unit) {
+        var current: Class<*>? = instance.javaClass
+        while (current != null) {
+            val cls = current
+            cls.declaredFields.forEach { field ->
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(instance)
+                }.getOrNull()
+                block(field.name, value)
+            }
+            current = cls.superclass
+        }
+    }
 
     private fun getSignalLevelsForRender(out: IntArray) {
         out[0] = 0
         out[1] = 0
-        val orderedSubIds = simSignalLevels.keys.sortedWith(
+        val candidates = if (activeSubIds.isNotEmpty()) {
+            activeSubIds.toList()
+        } else {
+            simSignalLevels.keys.toList()
+        }
+        val orderedSubIds = candidates.sortedWith(
             compareBy(
                 {
                     when {
@@ -610,6 +684,22 @@ class DualRowSignalHookV : MobileSignalHook() {
 
     private val renderLevels = IntArray(2)
 
+    private fun resolveSignalBitmap(
+        slot: Int,
+        level: Int,
+        isUseTint: Boolean,
+        isLight: Boolean
+    ): Pair<String, Bitmap>? {
+        val requested = getSignalIconResName(slot, level, isUseTint, isLight)
+        dualSignalResMap[requested]?.let { return requested to it }
+
+        // Some icon packs do not ship tint/dark variants for every level. Fall
+        // back to the base drawable instead of leaving the replacement blank.
+        val base = getSignalIconResName(slot, level, false, true)
+        dualSignalResMap[base]?.let { return base to it }
+        return null
+    }
+
     private fun refreshDualIconsForView(
         rootView: ViewGroup,
         isUseTint: Boolean,
@@ -617,36 +707,42 @@ class DualRowSignalHookV : MobileSignalHook() {
         color: Int? = null
     ) {
         val shouldUseDual = getActiveMobileControllerCount() > 1
-        syncDualSignalVisibility(rootView, shouldUseDual)
-        if (!shouldUseDual) return
+        if (!shouldUseDual || !dualSignalResLoaded) {
+            syncDualSignalVisibility(rootView, false)
+            return
+        }
 
-        val dualContainer = rootView.findByViewId<FrameLayout>(ID_DUAL_CONTAINER) ?: return
-        if (dualContainer.visibility != View.VISIBLE) return
-
-        val slot1 = dualContainer.findByViewId<ImageView>(ID_SIGNAL_SLOT1) ?: return
-        val slot2 = dualContainer.findByViewId<ImageView>(ID_SIGNAL_SLOT2) ?: return
+        val dualContainer = rootView.findByViewId<FrameLayout>(ID_DUAL_CONTAINER)
+        if (dualContainer == null) {
+            syncDualSignalVisibility(rootView, false)
+            return
+        }
+        val slot1 = dualContainer.findByViewId<ImageView>(ID_SIGNAL_SLOT1)
+        val slot2 = dualContainer.findByViewId<ImageView>(ID_SIGNAL_SLOT2)
+        if (slot1 == null || slot2 == null) {
+            syncDualSignalVisibility(rootView, false)
+            return
+        }
 
         getSignalLevelsForRender(renderLevels)
         val dataLevel = renderLevels[0]
         val noDataLevel = renderLevels[1]
-
-        val slot1ResName = getSignalIconResName(1, dataLevel, isUseTint, isLight)
-        val slot2ResName = getSignalIconResName(2, noDataLevel, isUseTint, isLight)
-        val slot1Bitmap = dualSignalResMap[slot1ResName]
-        val slot2Bitmap = dualSignalResMap[slot2ResName]
-        if (slot1Bitmap == null || slot2Bitmap == null) {
+        val slot1Resolved = resolveSignalBitmap(1, dataLevel, isUseTint, isLight)
+        val slot2Resolved = resolveSignalBitmap(2, noDataLevel, isUseTint, isLight)
+        if (slot1Resolved == null || slot2Resolved == null) {
+            syncDualSignalVisibility(rootView, false)
             XposedLog.w(
                 TAG,
                 lpparam.packageName,
-                "refreshDualIcons: bitmap not found! slot1=$slot1ResName, slot2=$slot2ResName"
+                "DualRowSignal: render bitmap missing levels=[$dataLevel,$noDataLevel] tint=$isUseTint light=$isLight"
             )
             return
         }
 
-        val needsTint = isUseTint && selectedIconStyle != "theme"
-        slot1.setImageBitmap(slot1Bitmap)
-        slot2.setImageBitmap(slot2Bitmap)
+        slot1.setImageBitmap(slot1Resolved.second)
+        slot2.setImageBitmap(slot2Resolved.second)
 
+        val needsTint = isUseTint && selectedIconStyle != "theme"
         if (needsTint && color != null) {
             slot1.setColorFilter(color, PorterDuff.Mode.SRC_IN)
             slot2.setColorFilter(color, PorterDuff.Mode.SRC_IN)
@@ -654,22 +750,28 @@ class DualRowSignalHookV : MobileSignalHook() {
             slot1.clearColorFilter()
             slot2.clearColorFilter()
         }
+
+        dualContainer.requestLayout()
+        dualContainer.invalidate()
+        syncDualSignalVisibility(rootView, true)
+
+        val identity = System.identityHashCode(rootView)
+        val signature = "$dataLevel/$noDataLevel:$isUseTint:$isLight:${slot1Resolved.first}:${slot2Resolved.first}"
+        if (renderSignatures.put(identity, signature) != signature) {
+            XposedLog.i(
+                TAG,
+                lpparam.packageName,
+                "DualRowSignal: render levels=[$dataLevel,$noDataLevel] slot1=${slot1Resolved.first} slot2=${slot2Resolved.first} root=${rootView.javaClass.name}"
+            )
+        }
     }
 
     private val refreshRunnable = Runnable {
         viewCache.entries.forEach { (subId, viewSet) ->
-            // viewSet is a synchronizedSet; iterate over a stable snapshot.
             val snapshot = synchronized(viewSet) { viewSet.toList() }
             snapshot.forEach { rootView ->
-                // Do not discard a newly constructed view just because it has
-                // not attached yet. cacheTrackedView registered an attach callback
-                // that will schedule another refresh at the correct time.
                 if (!rootView.isAttachedToWindow) return@forEach
-
-                if (!ensureDualSignalContainer(rootView, subId)) {
-                    return@forEach
-                }
-
+                if (!ensureDualSignalContainer(rootView, subId)) return@forEach
                 val dark = viewDarkState[System.identityHashCode(rootView)]
                 refreshDualIconsForView(
                     rootView,
@@ -693,19 +795,6 @@ class DualRowSignalHookV : MobileSignalHook() {
         mobileSignal?.visibility = if (useDualSignal) View.GONE else View.VISIBLE
     }
 
-    private inline fun <T, R> Iterable<T>.associateNotNull(
-        transform: (T) -> Pair<R, Int>?
-    ): Map<R, Int> {
-        val out = LinkedHashMap<R, Int>()
-        for (item in this) {
-            val pair = transform(item) ?: continue
-            out[pair.first] = pair.second
-        }
-        return out
-    }
-
-    // ==================== 图标资源名称生成 ====================
-
     private fun getSignalIconResName(
         slot: Int,
         level: Int,
@@ -718,6 +807,6 @@ class DualRowSignalHookV : MobileSignalHook() {
         } else {
             "_tint"
         }
-        return "statusbar_signal_${slot}_$level$colorMode$iconStyle"
+        return "statusbar_signal_${slot}_${level.coerceIn(0, 5)}$colorMode$iconStyle"
     }
 }
