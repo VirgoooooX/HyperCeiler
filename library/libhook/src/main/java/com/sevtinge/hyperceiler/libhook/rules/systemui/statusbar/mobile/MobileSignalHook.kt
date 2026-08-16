@@ -356,9 +356,8 @@ abstract class MobileSignalHook : StatusBarHook() {
      * The stock mobile_signal is owned by a separate HyperOS 4 collector.  It can
      * turn VISIBLE again after DualRowSignalHookV has rendered successfully,
      * producing exactly one custom dual-row icon plus one stock single-row icon.
-     * Re-assert ownership immediately before every draw while the temporary startup
-     * guard is active. Alpha/scale are also clamped so a later visibility-only update
-     * cannot make the stock glyph reappear.
+     * Re-assert ownership immediately before every draw.  Alpha/scale are also
+     * clamped so a later visibility-only update cannot make the stock glyph reappear.
      */
     private fun enforceDualRowVisualOwnership(rootView: ViewGroup, subId: Int): Boolean {
         if (this !is DualRowSignalHookV) return false
@@ -411,22 +410,6 @@ abstract class MobileSignalHook : StatusBarHook() {
         if (rootView.viewTreeObserver.isAlive) {
             rootView.viewTreeObserver.addOnPreDrawListener(preDrawListener)
         }
-
-        // Validation build: keep the known-good per-frame guard only through the
-        // startup/bind settling window. After 10 seconds, remove it and rely on the
-        // existing construct/bind/tint event paths for steady-state ownership.
-        rootView.postDelayed({
-            if (!dualRowPreDrawRoots.remove(identity)) return@postDelayed
-            if (rootView.viewTreeObserver.isAlive) {
-                rootView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
-            }
-            rootView.removeOnAttachStateChangeListener(attachListener)
-            XposedLog.i(
-                TAG,
-                lpparam.packageName,
-                "DualRowGuard: preDraw detached after 10000ms subId=$subId root=$identity"
-            )
-        }, 10_000L)
     }
 
     /**
