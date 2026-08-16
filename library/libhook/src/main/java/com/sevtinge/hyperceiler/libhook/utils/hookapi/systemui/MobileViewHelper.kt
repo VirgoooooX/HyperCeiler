@@ -192,4 +192,20 @@ object MobileViewHelper {
             XposedLog.e(TAG, "com.android.systemui", "collectFlow error", e)
         }
     }
+
+    /**
+     * Nullable-safe variant used for diagnostics of OS4 StateFlows whose current
+     * value may legitimately be null. Keep the legacy non-null API unchanged for
+     * existing callers that expect concrete values such as tint Triple.
+     */
+    fun collectNullableFlow(view: View, flow: Any, consumer: Consumer<Any?>) {
+        try {
+            val javaAdapterKt = loadClass("com.android.systemui.util.kotlin.JavaAdapterKt")
+            com.sevtinge.hyperceiler.libhook.base.BaseHook.callStaticMethod(
+                javaAdapterKt, "collectFlow", view, flow, consumer
+            )
+        } catch (e: Throwable) {
+            XposedLog.e(TAG, "com.android.systemui", "collectNullableFlow error", e)
+        }
+    }
 }
