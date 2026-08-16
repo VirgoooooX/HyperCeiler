@@ -43,6 +43,7 @@ import com.sevtinge.hyperceiler.settings.SettingsFragment;
 import com.sevtinge.hyperceiler.settings.SettingsPageFragment;
 import com.sevtinge.hyperceiler.utils.NoticeProcessor;
 import com.sevtinge.hyperceiler.utils.PersistConfig;
+import com.sevtinge.hyperceiler.utils.os4.Os4LauncherRootPatcherSafe;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -81,12 +82,19 @@ public class HomePageActivity extends AppCompatActivity
             finish();
             return;
         }
-        if (!isVersionListed()) {
+        if (!isVersionListed() && !isExperimentalAndroid17HyperOS4()) {
             showUnsupportedVersionDialog();
             return;
         }
         // Activity 启动阶段，绑定 UI 任务（如签名校验弹窗、公告展示）
         AppInitializer.initOnActivityCreate(this, this);
+        if (isExperimentalAndroid17HyperOS4()) {
+            // HyperOS 4 starts com.miui.home through hyos_spawner rather than
+            // the normal Zygote/ART path. Keep the launcher-specific root
+            // patcher app-side instead of depending on an LSPosed Java entry
+            // inside the Flutter/Rust launcher process.
+            Os4LauncherRootPatcherSafe.initialize();
+        }
         setContentView(R.layout.activity_home);
         setupNavigation();
         restoreCurrentPage(savedInstanceState);
@@ -206,6 +214,16 @@ public class HomePageActivity extends AppCompatActivity
     @Override
     public void onDestroy() {
         super.onDestroy();
+    }
+
+    /**
+     * Android 17 / HyperOS 4 is an experimental compatibility target in this fork.
+     * Keep the upstream allow-list strict for every other unknown platform, while
+     * allowing this branch's OS4 launcher implementation to be configured and tested.
+     */
+    private boolean isExperimentalAndroid17HyperOS4() {
+        float hyperOsVersion = getHyperOSVersion();
+        return getAndroidVersion() == 37 && hyperOsVersion >= 4.0f && hyperOsVersion < 5.0f;
     }
 
     private void showUnsupportedVersionDialog() {

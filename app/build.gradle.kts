@@ -90,6 +90,13 @@ android {
         dex {
             useLegacyPackaging = true
         }
+        jniLibs {
+            // The HyperOS 4 root helper is launched by a root app_process,
+            // outside HyperCeiler's normal linker namespace. Keep a real
+            // filesystem copy under ApplicationInfo.nativeLibraryDir so the
+            // helper can load it by absolute path.
+            useLegacyPackaging = true
+        }
     }
 
     val properties: Properties? = loadPropertiesFromFile("signing.properties")
@@ -165,6 +172,11 @@ android {
         }
     }
 
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
 }
 
 afterEvaluate {
