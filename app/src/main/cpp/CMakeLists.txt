@@ -8,21 +8,16 @@ target_compile_features(hyperceiler_os4_launcher PRIVATE c_std_11)
 target_compile_options(hyperceiler_os4_launcher PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(hyperceiler_os4_launcher PRIVATE dl log)
 
-# Root-side helper used by the hyos_spawner-compatible path. The v11 watcher
-# seizes the launcher before libapp_launcher.so returns from mmap, patches the
-# Rust x-count bounds through PTRACE_POKETEXT, then intercepts the first
-# DeviceConfigs::save_device_param call before GridConfig consumes 5x8.
-# os4_root_patcher.c remains as a one-shot diagnostic fallback.
+# Root-side helper used by the hyos_spawner-compatible path. v12 arms the
+# persistent hyos_spawner before Launcher restart, catches the forked child
+# under ptrace, then gates that child syscall-by-syscall until the exact Rust
+# launcher mapping appears. This applies code/data patches before the child can
+# execute Rust launcher initialization.
 add_library(
     hyperceiler_os4_root
     SHARED
     os4_root_patcher.c
-    os4_root_softbreak_v11.c
-)
-
-set_source_files_properties(
-    os4_root_softbreak_v11.c
-    PROPERTIES COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/os4_root_v11_compat.h"
+    os4_root_softbreak_v12.c
 )
 
 target_compile_features(hyperceiler_os4_root PRIVATE c_std_11)
