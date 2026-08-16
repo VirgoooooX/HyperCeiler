@@ -20,5 +20,10 @@ add_library(
     os4_root_softbreak_v11.c
 )
 
+set_source_files_properties(
+    os4_root_softbreak_v11.c
+    PROPERTIES COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/os4_root_v11_compat.h"
+)
+
 target_compile_features(hyperceiler_os4_root PRIVATE c_std_11)
 target_compile_options(hyperceiler_os4_root PRIVATE -Wall -Wextra -Werror)
