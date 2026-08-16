@@ -16,6 +16,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.telephony.SubscriptionManager
 import android.util.SparseArray
 import android.view.View
@@ -67,12 +68,13 @@ class DualRowSignalHookV : MobileSignalHook() {
     private val simDataSimState = ConcurrentHashMap<Int, Boolean>()
     private val simSlotIndices = ConcurrentHashMap<Int, Int>()
     private val activeSubIds = ConcurrentHashMap.newKeySet<Int>()
+    private val capturedSubIds = ConcurrentHashMap.newKeySet<Int>()
     private val missingViewWarnings = ConcurrentHashMap.newKeySet<String>()
     private val pendingViewLogs = ConcurrentHashMap.newKeySet<Int>()
     private val attachRefreshRegistered = ConcurrentHashMap.newKeySet<Int>()
     private val controllerFieldLogs = ConcurrentHashMap.newKeySet<String>()
     private val renderSignatures = ConcurrentHashMap<Int, String>()
-    private val samplerStarted = AtomicBoolean(false)
+    private val samplerRunning = AtomicBoolean(false)
 
     @Volatile
     private var networkControllerInstance: Any? = null
@@ -82,6 +84,9 @@ class DualRowSignalHookV : MobileSignalHook() {
 
     @Volatile
     private var dualSignalResLoaded = false
+
+    @Volatile
+    private var samplerDeadlineUptimeMs = 0L
 
     private val viewDarkState = ConcurrentHashMap<Int, DarkInfo>()
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
@@ -290,7 +295,7 @@ class DualRowSignalHookV : MobileSignalHook() {
                 if (networkControllerInstance == null) {
                     readField(signalController, "mNetworkController")?.let { network ->
                         networkControllerInstance = network
-                        startControllerSampler()
+                        if (!controllerBootstrapReady()) startControllerSampler("network-controller")
                     }
                 }
                 if (captureSignalController(signalController, "notifyListeners", null)) refreshAllCachedViews()
@@ -315,6 +320,7 @@ class DualRowSignalHookV : MobileSignalHook() {
                 }
                 activeSubIds.clear()
                 activeSubIds.addAll(newSubIds)
+                capturedSubIds.clear()
                 val slotCount = newSlotIndices.values.toSet().size
                 activeSubscriptionCount = if (slotCount > 0) slotCount else newSubIds.size
                 if (newSubIds.isEmpty()) {
@@ -331,24 +337,48 @@ class DualRowSignalHookV : MobileSignalHook() {
                 }
                 XposedLog.i(TAG, lpparam.packageName,
                     "DualRowSignal: subscriptions updated count=$activeSubscriptionCount ids=$newSubIds slots=$newSlotIndices")
-                startControllerSampler()
+
+                // Subscription topology changes always deserve one immediate UI pass.
+                // Afterwards only actual controller-state changes trigger redraws.
                 pollControllersOnce("subscriptions")
                 refreshAllCachedViews()
+                if (!controllerBootstrapReady()) startControllerSampler("subscriptions")
                 result
             }
     }
 
-    private fun startControllerSampler() {
-        if (!samplerStarted.compareAndSet(false, true)) return
-        XposedLog.i(TAG, lpparam.packageName, "DualRowSignal: OS4 controller sampler started")
+    private fun startControllerSampler(reason: String) {
+        val deadline = SystemClock.uptimeMillis() + BOOTSTRAP_WINDOW_MS
+        if (deadline > samplerDeadlineUptimeMs) samplerDeadlineUptimeMs = deadline
+        if (!samplerRunning.compareAndSet(false, true)) return
+        XposedLog.i(TAG, lpparam.packageName,
+            "DualRowSignal: OS4 controller bootstrap started reason=$reason window=${BOOTSTRAP_WINDOW_MS}ms")
         mainHandler.post(controllerPollRunnable)
     }
 
     private val controllerPollRunnable = object : Runnable {
         override fun run() {
-            pollControllersOnce("poll")
-            if (activeSubscriptionCount > 1) refreshAllCachedViews()
-            mainHandler.postDelayed(this, 750L)
+            val changed = pollControllersOnce("bootstrap")
+            if (changed) refreshAllCachedViews()
+
+            val ready = controllerBootstrapReady()
+            val timedOut = SystemClock.uptimeMillis() >= samplerDeadlineUptimeMs
+            if (ready || timedOut) {
+                samplerRunning.set(false)
+                XposedLog.i(TAG, lpparam.packageName,
+                    "DualRowSignal: OS4 controller bootstrap stopped ready=$ready captured=${capturedSubIds.size}/${activeSubIds.size} timedOut=$timedOut")
+                return
+            }
+            mainHandler.postDelayed(this, BOOTSTRAP_POLL_INTERVAL_MS)
+        }
+    }
+
+    private fun controllerBootstrapReady(): Boolean {
+        val expected = activeSubIds.toList()
+        if (expected.isEmpty()) return false
+        return expected.all { subId ->
+            capturedSubIds.contains(subId) &&
+                (simSlotIndices[subId] ?: SubscriptionManager.INVALID_SIM_SLOT_INDEX) >= 0
         }
     }
 
@@ -433,6 +463,7 @@ class DualRowSignalHookV : MobileSignalHook() {
         val oldLevel = simSignalLevels.put(subscriptionId, level)
         val oldDataSim = simDataSimState.put(subscriptionId, dataSim)
         val oldSlotIndex = simSlotIndices.put(subscriptionId, slotIndex)
+        capturedSubIds.add(subscriptionId)
         val changed = oldLevel != level || oldDataSim != dataSim || oldSlotIndex != slotIndex
         if (changed) {
             XposedLog.i(TAG, lpparam.packageName,
@@ -510,22 +541,32 @@ class DualRowSignalHookV : MobileSignalHook() {
                 "DualRowSignal: render bitmap missing levels=[$dataLevel,$noDataLevel] tint=$isUseTint light=$isLight")
             return
         }
+
+        val needsTint = isUseTint && selectedIconStyle != "theme"
+        val tintSignature = if (needsTint) color else null
+        val identity = System.identityHashCode(rootView)
+        val signature = "$dataLevel/$noDataLevel:$isUseTint:$isLight:$tintSignature:${slot1Resolved.first}:${slot2Resolved.first}"
+        if (renderSignatures[identity] == signature) {
+            // Keep visibility ownership correct, but avoid bitmap, tint, layout and
+            // invalidation work when the rendered state is byte-for-byte unchanged.
+            syncDualSignalVisibility(rootView, true)
+            return
+        }
+
         slot1.setImageBitmap(slot1Resolved.second)
         slot2.setImageBitmap(slot2Resolved.second)
-        val needsTint = isUseTint && selectedIconStyle != "theme"
         if (needsTint && color != null) {
             slot1.setColorFilter(color, PorterDuff.Mode.SRC_IN)
             slot2.setColorFilter(color, PorterDuff.Mode.SRC_IN)
         } else {
             slot1.clearColorFilter(); slot2.clearColorFilter()
         }
-        dualContainer.requestLayout(); dualContainer.invalidate(); syncDualSignalVisibility(rootView, true)
-        val identity = System.identityHashCode(rootView)
-        val signature = "$dataLevel/$noDataLevel:$isUseTint:$isLight:${slot1Resolved.first}:${slot2Resolved.first}"
-        if (renderSignatures.put(identity, signature) != signature) {
-            XposedLog.i(TAG, lpparam.packageName,
-                "DualRowSignal: render levels=[$dataLevel,$noDataLevel] slot1=${slot1Resolved.first} slot2=${slot2Resolved.first} root=${rootView.javaClass.name}")
-        }
+        dualContainer.requestLayout()
+        dualContainer.invalidate()
+        syncDualSignalVisibility(rootView, true)
+        renderSignatures[identity] = signature
+        XposedLog.i(TAG, lpparam.packageName,
+            "DualRowSignal: render levels=[$dataLevel,$noDataLevel] slot1=${slot1Resolved.first} slot2=${slot2Resolved.first} root=${rootView.javaClass.name}")
     }
 
     private val refreshRunnable = Runnable {
@@ -556,5 +597,10 @@ class DualRowSignalHookV : MobileSignalHook() {
             if (!isLight) "_dark" else ""
         } else "_tint"
         return "statusbar_signal_${slot}_${level.coerceIn(0, 5)}$colorMode$iconStyle"
+    }
+
+    companion object {
+        private const val BOOTSTRAP_POLL_INTERVAL_MS = 750L
+        private const val BOOTSTRAP_WINDOW_MS = 6000L
     }
 }
