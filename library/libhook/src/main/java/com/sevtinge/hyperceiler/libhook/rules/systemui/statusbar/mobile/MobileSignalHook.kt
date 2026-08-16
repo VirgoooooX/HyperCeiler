@@ -18,6 +18,7 @@
  */
 package com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.mobile
 
+import android.os.SystemClock
 import android.telephony.SubscriptionManager
 import android.view.View
 import android.view.ViewGroup
@@ -29,9 +30,11 @@ import com.sevtinge.hyperceiler.libhook.utils.hookapi.systemui.MobileClass.moder
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.systemui.MobileViewHelper
 import io.github.lingqiqi5211.ezhooktool.core.callMethodAs
 import io.github.lingqiqi5211.ezhooktool.core.findMethod
-import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getIntField
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createAfterHook
+import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createInterceptHook
+import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getIntField
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 移动信号 Hook 扩展基类
@@ -45,6 +48,240 @@ abstract class MobileSignalHook : StatusBarHook() {
     private val dualRowPreDrawRoots = ConcurrentHashMap.newKeySet<Int>()
     private val suppressedStockSignalViews = ConcurrentHashMap.newKeySet<Int>()
     private val dualContainerMarkerId by lazy { getOrCreateViewId("dual_signal_container") }
+
+    // Temporary HyperOS 4 trace instrumentation.  It only records during the
+    // first TRACE_WINDOW_MS after the hook is installed, and does not alter the
+    // already verified dual-row ownership behavior.
+    private val dualRowTraceInstalled = AtomicBoolean(false)
+    private val dualRowTraceOwners = ConcurrentHashMap.newKeySet<Int>()
+    private val dualRowTraceFlows = ConcurrentHashMap.newKeySet<Int>()
+    private val dualRowTraceFlowValues = ConcurrentHashMap<Int, String>()
+
+    @Volatile
+    private var dualRowTraceUntilUptimeMs = 0L
+
+    private fun installDualRowTrace() {
+        if (this !is DualRowSignalHookV) return
+        if (!dualRowTraceInstalled.compareAndSet(false, true)) return
+
+        dualRowTraceUntilUptimeMs = SystemClock.uptimeMillis() + TRACE_WINDOW_MS
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "DualRowTrace: armed visibility + mobile StateFlow trace window=${TRACE_WINDOW_MS}ms"
+        )
+
+        val setVisibility = View::class.java.getDeclaredMethod(
+            "setVisibility",
+            Int::class.javaPrimitiveType!!
+        )
+        setVisibility.createInterceptHook { chain ->
+            val view = chain.thisObject as? View ?: return@createInterceptHook chain.proceed()
+            val requested = chain.args.getOrNull(0) as? Int
+                ?: return@createInterceptHook chain.proceed()
+
+            if (!dualRowTraceActive() || !isDualRowTraceTarget(view)) {
+                return@createInterceptHook chain.proceed()
+            }
+
+            val before = view.visibility
+            // We specifically need the upstream writer that revives a stock/duplicate
+            // mobile view.  HyperCeiler's own GONE writes are intentionally ignored.
+            val traceRevive = requested == View.VISIBLE && before != View.VISIBLE
+            val caller = if (traceRevive) dualRowTraceCallerStack() else ""
+            val result = chain.proceed()
+
+            if (traceRevive) {
+                val after = view.visibility
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "DualRowTrace VIS subId=${findTraceSubId(view)} view=${traceViewName(view)} " +
+                        "before=${visibilityName(before)} requested=VISIBLE after=${visibilityName(after)} " +
+                        "class=${view.javaClass.name} caller=$caller"
+                )
+            }
+            result
+        }
+    }
+
+    private fun dualRowTraceActive(): Boolean =
+        this is DualRowSignalHookV && SystemClock.uptimeMillis() <= dualRowTraceUntilUptimeMs
+
+    private fun isDualRowTraceTarget(view: View): Boolean {
+        if (view.javaClass.simpleName == "ModernStatusBarMobileView") return true
+        return when (traceViewName(view)) {
+            "mobile_signal", "mobile_signal_container", "mobile_group" -> true
+            else -> false
+        }
+    }
+
+    private fun traceViewName(view: View): String {
+        if (view.id == View.NO_ID) return "<no-id>"
+        return runCatching { view.resources.getResourceEntryName(view.id) }
+            .getOrElse { "id=${view.id}" }
+    }
+
+    private fun findTraceSubId(view: View): Int {
+        var current: View? = view
+        repeat(10) {
+            val candidate = current ?: return -1
+            if (candidate.javaClass.simpleName == "ModernStatusBarMobileView") {
+                return runCatching { candidate.getIntField("subId") }.getOrDefault(-1)
+            }
+            current = candidate.parent as? View
+        }
+        return -1
+    }
+
+    private fun visibilityName(value: Int): String = when (value) {
+        View.VISIBLE -> "VISIBLE"
+        View.INVISIBLE -> "INVISIBLE"
+        View.GONE -> "GONE"
+        else -> value.toString()
+    }
+
+    private fun dualRowTraceCallerStack(): String {
+        val systemUiFrames = Thread.currentThread().stackTrace.asSequence()
+            .filter { frame ->
+                frame.className.startsWith("com.android.systemui") ||
+                    frame.className.startsWith("kotlinx.coroutines")
+            }
+            .take(14)
+            .map { frame -> "${frame.className}.${frame.methodName}:${frame.lineNumber}" }
+            .toList()
+        if (systemUiFrames.isNotEmpty()) return systemUiFrames.joinToString(" <- ")
+
+        return Thread.currentThread().stackTrace.asSequence()
+            .filterNot { frame ->
+                frame.className.startsWith("java.lang.Thread") ||
+                    frame.className.startsWith("io.github.lingqiqi5211") ||
+                    frame.className.startsWith("io.github.libxposed")
+            }
+            .take(10)
+            .joinToString(" <- ") { frame ->
+                "${frame.className}.${frame.methodName}:${frame.lineNumber}"
+            }
+    }
+
+    private fun traceMobileBinderObjects(
+        container: ViewGroup,
+        subId: Int,
+        args: Array<out Any?>,
+        binding: Any,
+    ) {
+        if (!dualRowTraceActive()) return
+
+        args.forEachIndexed { index, value ->
+            if (value != null) traceMobileOwner(container, subId, "bind.arg$index", value, 0)
+        }
+        traceMobileOwner(container, subId, "bind.result", binding, 0)
+    }
+
+    private fun traceMobileOwner(
+        container: ViewGroup,
+        subId: Int,
+        label: String,
+        owner: Any,
+        depth: Int,
+    ) {
+        if (!dualRowTraceActive()) return
+        if (owner is View || owner is String || owner is Number || owner is Boolean || owner.javaClass.isEnum) return
+
+        val className = owner.javaClass.name
+        val interestingOwner = className.startsWith("com.android.systemui") ||
+            className.startsWith("kotlinx.coroutines")
+        if (!interestingOwner) return
+
+        val identity = System.identityHashCode(owner)
+        if (!dualRowTraceOwners.add(identity)) return
+
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "DualRowTrace OWNER subId=$subId label=$label class=$className"
+        )
+
+        var current: Class<*>? = owner.javaClass
+        while (current != null && current != Any::class.java) {
+            current.declaredFields.forEach { field ->
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(owner)
+                }.getOrNull() ?: return@forEach
+
+                val fieldPath = "$label.${field.name}"
+                if (isStateFlowLike(value)) {
+                    traceStateFlow(container, subId, owner.javaClass.name, fieldPath, value)
+                } else if (depth == 0 && shouldTraceNestedOwner(value)) {
+                    traceMobileOwner(container, subId, fieldPath, value, depth + 1)
+                }
+            }
+            current = current.superclass
+        }
+    }
+
+    private fun shouldTraceNestedOwner(value: Any): Boolean {
+        val name = value.javaClass.name
+        return name.startsWith("com.android.systemui.statusbar.pipeline.mobile") ||
+            name.contains("MiuiCellularIconVM") ||
+            name.contains("MobileIconViewModel")
+    }
+
+    private fun isStateFlowLike(value: Any): Boolean {
+        val clazz = value.javaClass
+        if (clazz.name.contains("StateFlow", ignoreCase = true)) return true
+        return clazz.interfaces.any { it.name.contains("StateFlow", ignoreCase = true) }
+    }
+
+    private fun traceStateFlow(
+        container: ViewGroup,
+        subId: Int,
+        ownerClass: String,
+        fieldPath: String,
+        flow: Any,
+    ) {
+        if (dualRowTraceFlows.size >= MAX_TRACED_FLOWS) return
+        val identity = System.identityHashCode(flow)
+        if (!dualRowTraceFlows.add(identity)) return
+
+        val initial = readTraceFlowValue(flow)
+        val initialSignature = traceValue(initial)
+        dualRowTraceFlowValues[identity] = initialSignature
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "DualRowTrace FLOW subId=$subId owner=$ownerClass field=$fieldPath " +
+                "flow=${flow.javaClass.name} initial=$initialSignature"
+        )
+
+        MobileViewHelper.collectFlow(container, flow) { emitted ->
+            if (!dualRowTraceActive()) return@collectFlow
+            val signature = traceValue(emitted)
+            if (dualRowTraceFlowValues.put(identity, signature) != signature) {
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "DualRowTrace EMIT subId=$subId field=$fieldPath value=$signature"
+                )
+            }
+        }
+    }
+
+    private fun readTraceFlowValue(flow: Any): Any? = runCatching {
+        val method = flow.javaClass.methods.firstOrNull {
+            it.name == "getValue" && it.parameterCount == 0
+        } ?: return@runCatching null
+        method.isAccessible = true
+        method.invoke(flow)
+    }.getOrNull()
+
+    private fun traceValue(value: Any?): String {
+        if (value == null) return "null"
+        val text = runCatching { value.toString() }.getOrDefault("<toString failed>")
+        val clipped = if (text.length > 220) text.take(220) + "…" else text
+        return "${value.javaClass.simpleName}($clipped)"
+    }
 
     private fun hardCollapseDualRowRoot(rootView: ViewGroup, subId: Int, reason: String) {
         val identity = System.identityHashCode(rootView)
@@ -180,6 +417,7 @@ abstract class MobileSignalHook : StatusBarHook() {
      * @param callback 回调 (rootView, subId)
      */
     protected fun hookConstructAndBind(callback: (ViewGroup, Int) -> Unit) {
+        installDualRowTrace()
         modernStatusBarMobileView.findMethod { name("constructAndBind") }
             .createAfterHook { param ->
                 val rootView = param.result as? ViewGroup ?: return@createAfterHook
@@ -205,13 +443,18 @@ abstract class MobileSignalHook : StatusBarHook() {
             .createAfterHook { param ->
                 val container = param.args[0] as? ViewGroup ?: return@createAfterHook
                 val subId = runCatching { container.getIntField("subId") }.getOrDefault(-1)
+                val binding = param.result ?: return@createAfterHook
+
+                // Trace before suppressing a duplicate root so we can see the exact
+                // ViewModel/StateFlow graph that owns both host and secondary roots.
+                traceMobileBinderObjects(container, subId, param.args, binding)
+
                 if (subId >= 0) {
                     registerDualRowPreDrawGuard(container, subId)
                     if (enforceDualRowVisualOwnership(container, subId)) {
                         return@createAfterHook
                     }
                 }
-                val binding = param.result ?: return@createAfterHook
 
                 val tintFlow = findTintLightColorFlow(binding)
                 if (tintFlow == null) {
@@ -287,5 +530,10 @@ abstract class MobileSignalHook : StatusBarHook() {
 
     protected fun forEachMobileView(subId: Int, callback: (View) -> Unit) {
         MobileViewHelper.forEachMobileView(subId, viewCache, callback)
+    }
+
+    companion object {
+        private const val TRACE_WINDOW_MS = 90_000L
+        private const val MAX_TRACED_FLOWS = 32
     }
 }
