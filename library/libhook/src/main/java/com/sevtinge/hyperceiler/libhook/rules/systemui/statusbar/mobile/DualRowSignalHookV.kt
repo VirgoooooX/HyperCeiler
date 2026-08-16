@@ -95,6 +95,14 @@ class DualRowSignalHookV : MobileSignalHook() {
         BaseHook.registerHandlerHotReloadCleanup(mainHandler)
         listenMobileSignal()
         hookConstructAndBind { rootView, subId -> onViewCreated(rootView, subId) }
+        // HyperOS 4 may migrate the visible mobile root when the default data SIM
+        // changes. The construct hook intentionally skips the duplicate root, so
+        // prewarm every binder-owned root here. A later host migration can then
+        // reveal an already-initialized dual-row container instead of stock signal.
+        hookBind { rootView, _ ->
+            val subId = runCatching { getIntField(rootView, "subId") }.getOrDefault(-1)
+            if (subId >= 0) onViewCreated(rootView, subId)
+        }
         hookDarkMode { rootView, darkInfo -> onDarkModeChanged(rootView, darkInfo) }
     }
 
