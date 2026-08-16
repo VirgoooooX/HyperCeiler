@@ -52,6 +52,13 @@ abstract class MobileSignalHook : StatusBarHook() {
     private val dualRowSnapshotOwners = ConcurrentHashMap.newKeySet<Int>()
     private val dualRowSnapshotFlows = ConcurrentHashMap.newKeySet<Int>()
 
+    // Narrow dynamic diagnostics. Only three already-identified StateFlows are
+    // collected, using a nullable-safe consumer bound to the exact mobile view.
+    // No global View hook is installed.
+    private val dualRowKnownTraceBindings = ConcurrentHashMap.newKeySet<String>()
+    private val dualRowKnownFlowValues = ConcurrentHashMap<String, String>()
+    private val dualRowReviveSignatures = ConcurrentHashMap<Int, String>()
+
     private fun snapshotMobileBinderObjects(
         subId: Int,
         args: Array<out Any?>,
@@ -127,14 +134,7 @@ abstract class MobileSignalHook : StatusBarHook() {
     ) {
         val identity = System.identityHashCode(flow)
         if (!dualRowSnapshotFlows.add(identity)) return
-        val currentValue = runCatching {
-            flow.javaClass.methods.firstOrNull {
-                it.name == "getValue" && it.parameterCount == 0
-            }?.let { method ->
-                method.isAccessible = true
-                method.invoke(flow)
-            }
-        }.getOrNull()
+        val currentValue = readStateFlowValue(flow)
         XposedLog.i(
             TAG,
             lpparam.packageName,
@@ -156,6 +156,128 @@ abstract class MobileSignalHook : StatusBarHook() {
         val text = runCatching { value.toString() }.getOrDefault("<toString failed>")
         val clipped = if (text.length > 180) text.take(180) + "…" else text
         return "${value.javaClass.simpleName}($clipped)"
+    }
+
+    private fun readFieldValue(owner: Any?, name: String): Any? {
+        if (owner == null) return null
+        var current: Class<*>? = owner.javaClass
+        while (current != null && current != Any::class.java) {
+            val field = runCatching { current.getDeclaredField(name) }.getOrNull()
+            if (field != null) {
+                return runCatching {
+                    field.isAccessible = true
+                    field.get(owner)
+                }.getOrNull()
+            }
+            current = current.superclass
+        }
+        return null
+    }
+
+    private fun readStateFlowValue(flow: Any): Any? {
+        return runCatching {
+            flow.javaClass.methods.firstOrNull {
+                it.name == "getValue" && it.parameterCount == 0
+            }?.let { method ->
+                method.isAccessible = true
+                method.invoke(flow)
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * Trace only the three Flow paths already proven by the OS4 snapshots:
+     *  - MobileIconViewModel.isVisible          (whole mobile root)
+     *  - MiuiCellularIconVM.isVisible           (MIUI cellular visibility pair)
+     *  - MiuiCellularIconVM.signalIconId        (stock signal glyph source)
+     *
+     * Each collector is lifecycle-bound to the exact ModernStatusBarMobileView.
+     */
+    private fun traceKnownBinderFlows(
+        container: ViewGroup,
+        subId: Int,
+        args: Array<out Any?>,
+    ) {
+        if (this !is DualRowSignalHookV || subId < 0) return
+
+        val containerId = System.identityHashCode(container)
+        val surface = args.getOrNull(1)?.javaClass?.simpleName ?: "unknown"
+        dualRowKnownFlowValues["$containerId:surface"] = surface
+
+        val commonImpl = readFieldValue(args.getOrNull(1), "commonImpl")
+        val rootVisibleFlow = readFieldValue(commonImpl, "isVisible")
+        if (rootVisibleFlow != null && isSnapshotStateFlow(rootVisibleFlow)) {
+            traceKnownFlow(container, subId, surface, "rootVisible", rootVisibleFlow)
+        }
+
+        val miuiVm = args.getOrNull(2)
+        val vmProvider = readFieldValue(miuiVm, "vmProvider")
+        val cellularVm = if (vmProvider != null && isSnapshotStateFlow(vmProvider)) {
+            readStateFlowValue(vmProvider)
+        } else {
+            null
+        }
+        if (cellularVm?.javaClass?.name?.contains("MiuiCellularIconVM") == true) {
+            val cellularVisibleFlow = readFieldValue(cellularVm, "isVisible")
+            if (cellularVisibleFlow != null && isSnapshotStateFlow(cellularVisibleFlow)) {
+                traceKnownFlow(container, subId, surface, "cellularVisible", cellularVisibleFlow)
+            }
+
+            val signalIconIdFlow = readFieldValue(cellularVm, "signalIconId")
+            if (signalIconIdFlow != null && isSnapshotStateFlow(signalIconIdFlow)) {
+                traceKnownFlow(container, subId, surface, "signalIconId", signalIconIdFlow)
+            }
+        }
+    }
+
+    private fun traceKnownFlow(
+        container: ViewGroup,
+        subId: Int,
+        surface: String,
+        key: String,
+        flow: Any,
+    ) {
+        val containerId = System.identityHashCode(container)
+        val bindingKey = "$containerId:${System.identityHashCode(flow)}:$key"
+        if (!dualRowKnownTraceBindings.add(bindingKey)) return
+
+        val stateKey = "$containerId:$key"
+        val initial = snapshotValue(readStateFlowValue(flow))
+        dualRowKnownFlowValues[stateKey] = initial
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "DualRowKnown ARM subId=$subId surface=$surface key=$key value=$initial root=$containerId"
+        )
+
+        MobileViewHelper.collectNullableFlow(container, flow) { emitted ->
+            val value = snapshotValue(emitted)
+            val previous = dualRowKnownFlowValues.put(stateKey, value)
+            if (previous != value) {
+                XposedLog.i(
+                    TAG,
+                    lpparam.packageName,
+                    "DualRowKnown EMIT subId=$subId surface=$surface key=$key value=$value previous=$previous root=$containerId"
+                )
+            }
+        }
+    }
+
+    private fun logStockSignalRevival(rootView: ViewGroup, subId: Int) {
+        val rootId = System.identityHashCode(rootView)
+        val surface = dualRowKnownFlowValues["$rootId:surface"] ?: "unknown"
+        val rootVisible = dualRowKnownFlowValues["$rootId:rootVisible"] ?: "unknown"
+        val cellularVisible = dualRowKnownFlowValues["$rootId:cellularVisible"] ?: "unknown"
+        val signalIconId = dualRowKnownFlowValues["$rootId:signalIconId"] ?: "unknown"
+        val signature = "$surface|$rootVisible|$cellularVisible|$signalIconId"
+        if (dualRowReviveSignatures.put(rootId, signature) == signature) return
+
+        XposedLog.i(
+            TAG,
+            lpparam.packageName,
+            "DualRowKnown REVIVE subId=$subId surface=$surface rootVisible=$rootVisible " +
+                "cellularVisible=$cellularVisible signalIconId=$signalIconId root=$rootId"
+        )
     }
 
     private fun hardCollapseDualRowRoot(rootView: ViewGroup, subId: Int, reason: String) {
@@ -245,6 +367,9 @@ abstract class MobileSignalHook : StatusBarHook() {
         if (dualContainer.visibility != View.VISIBLE) return false
 
         val stockSignal = rootView.findById<View>("mobile_signal") ?: return false
+        if (stockSignal.visibility == View.VISIBLE) {
+            logStockSignalRevival(rootView, subId)
+        }
         stockSignal.visibility = View.GONE
         stockSignal.alpha = 0f
         stockSignal.scaleX = 0f
@@ -322,6 +447,7 @@ abstract class MobileSignalHook : StatusBarHook() {
                 // Read-only diagnostics: capture the mobile VM/Flow topology once,
                 // before duplicate-root suppression returns early.
                 snapshotMobileBinderObjects(subId, param.args, binding)
+                traceKnownBinderFlows(container, subId, param.args)
 
                 if (subId >= 0) {
                     registerDualRowPreDrawGuard(container, subId)
