@@ -21,6 +21,7 @@ package com.sevtinge.hyperceiler.libhook.rules.systemui.statusbar.mobile
 import android.telephony.SubscriptionManager
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.libhook.appbase.systemui.StatusBarHook
 import com.sevtinge.hyperceiler.libhook.utils.hookapi.systemui.MobileClass.miuiMobileIconBinder
@@ -41,6 +42,9 @@ abstract class MobileSignalHook : StatusBarHook() {
 
     private val suppressedDualRowRoots = ConcurrentHashMap.newKeySet<Int>()
     private val suppressedDualRowRootWidths = ConcurrentHashMap<Int, Int>()
+    private val dualRowPreDrawRoots = ConcurrentHashMap.newKeySet<Int>()
+    private val suppressedStockSignalViews = ConcurrentHashMap.newKeySet<Int>()
+    private val dualContainerMarkerId by lazy { getOrCreateViewId("dual_signal_container") }
 
     private fun hardCollapseDualRowRoot(rootView: ViewGroup, subId: Int, reason: String) {
         val identity = System.identityHashCode(rootView)
@@ -115,6 +119,63 @@ abstract class MobileSignalHook : StatusBarHook() {
     }
 
     /**
+     * The stock mobile_signal is owned by a separate HyperOS 4 collector.  It can
+     * turn VISIBLE again after DualRowSignalHookV has rendered successfully,
+     * producing exactly one custom dual-row icon plus one stock single-row icon.
+     * Re-assert ownership immediately before every draw.  Alpha/scale are also
+     * clamped so a later visibility-only update cannot make the stock glyph reappear.
+     */
+    private fun enforceDualRowVisualOwnership(rootView: ViewGroup, subId: Int): Boolean {
+        if (this !is DualRowSignalHookV) return false
+        if (suppressDuplicateDualRowRoot(rootView, subId)) return true
+
+        val dualContainer = rootView.findViewById<View>(dualContainerMarkerId) ?: return false
+        if (dualContainer.visibility != View.VISIBLE) return false
+
+        val stockSignal = rootView.findById<View>("mobile_signal") ?: return false
+        stockSignal.visibility = View.GONE
+        stockSignal.alpha = 0f
+        stockSignal.scaleX = 0f
+        stockSignal.scaleY = 0f
+        val identity = System.identityHashCode(stockSignal)
+        if (suppressedStockSignalViews.add(identity)) {
+            XposedLog.i(
+                TAG,
+                lpparam.packageName,
+                "DualRowSignal: stock mobile_signal permanently suppressed on host subId=$subId root=${rootView.javaClass.name}"
+            )
+        }
+        return false
+    }
+
+    private fun registerDualRowPreDrawGuard(rootView: ViewGroup, subId: Int) {
+        if (this !is DualRowSignalHookV) return
+        val identity = System.identityHashCode(rootView)
+        if (!dualRowPreDrawRoots.add(identity)) return
+
+        lateinit var preDrawListener: ViewTreeObserver.OnPreDrawListener
+        val attachListener = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) = Unit
+
+            override fun onViewDetachedFromWindow(v: View) {
+                if (rootView.viewTreeObserver.isAlive) {
+                    rootView.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+                }
+                rootView.removeOnAttachStateChangeListener(this)
+                dualRowPreDrawRoots.remove(identity)
+            }
+        }
+        preDrawListener = ViewTreeObserver.OnPreDrawListener {
+            enforceDualRowVisualOwnership(rootView, subId)
+            true
+        }
+        rootView.addOnAttachStateChangeListener(attachListener)
+        if (rootView.viewTreeObserver.isAlive) {
+            rootView.viewTreeObserver.addOnPreDrawListener(preDrawListener)
+        }
+    }
+
+    /**
      * Hook ModernStatusBarMobileView.constructAndBind
      * @param callback 回调 (rootView, subId)
      */
@@ -123,9 +184,11 @@ abstract class MobileSignalHook : StatusBarHook() {
             .createAfterHook { param ->
                 val rootView = param.result as? ViewGroup ?: return@createAfterHook
                 val subId = rootView.getIntField("subId")
+                registerDualRowPreDrawGuard(rootView, subId)
                 if (suppressDuplicateDualRowRoot(rootView, subId)) return@createAfterHook
                 try {
                     callback(rootView, subId)
+                    enforceDualRowVisualOwnership(rootView, subId)
                 } catch (e: Throwable) {
                     XposedLog.e(TAG, lpparam.packageName, "hookConstructAndBind callback error", e)
                 }
@@ -142,8 +205,11 @@ abstract class MobileSignalHook : StatusBarHook() {
             .createAfterHook { param ->
                 val container = param.args[0] as? ViewGroup ?: return@createAfterHook
                 val subId = runCatching { container.getIntField("subId") }.getOrDefault(-1)
-                if (subId >= 0 && suppressDuplicateDualRowRoot(container, subId)) {
-                    return@createAfterHook
+                if (subId >= 0) {
+                    registerDualRowPreDrawGuard(container, subId)
+                    if (enforceDualRowVisualOwnership(container, subId)) {
+                        return@createAfterHook
+                    }
                 }
                 val binding = param.result ?: return@createAfterHook
 
@@ -157,10 +223,11 @@ abstract class MobileSignalHook : StatusBarHook() {
                     try {
                         // Re-assert host ownership on every tint emission. Modern
                         // pipeline collectors can change visibility after bind.
-                        if (subId >= 0 && suppressDuplicateDualRowRoot(container, subId)) {
+                        if (subId >= 0 && enforceDualRowVisualOwnership(container, subId)) {
                             return@collectFlow
                         }
                         callback(container, extractDarkInfo(triple))
+                        if (subId >= 0) enforceDualRowVisualOwnership(container, subId)
                     } catch (e: Throwable) {
                         XposedLog.e(TAG, lpparam.packageName, "hookDarkMode flow error", e)
                     }
