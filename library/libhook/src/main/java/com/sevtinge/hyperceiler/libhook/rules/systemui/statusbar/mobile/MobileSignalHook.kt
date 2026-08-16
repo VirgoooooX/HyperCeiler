@@ -141,6 +141,14 @@ abstract class MobileSignalHook : StatusBarHook() {
             "DualRowSnapshot FLOW subId=$subId owner=$ownerClass field=$fieldPath " +
                 "flow=${flow.javaClass.name} value=${snapshotValue(currentValue)}"
         )
+
+        // Some OS4 StateFlows are providers whose current value is the actual
+        // MiuiCellularIconVM consumed by the binder. Expand that value read-only
+        // so we can identify the final signal/visibility fields without collecting
+        // the flow or installing any extra coroutine.
+        if (currentValue != null && shouldSnapshotNestedOwner(currentValue)) {
+            snapshotMobileOwner(subId, "$fieldPath<value>", currentValue, 0)
+        }
     }
 
     private fun snapshotValue(value: Any?): String {
