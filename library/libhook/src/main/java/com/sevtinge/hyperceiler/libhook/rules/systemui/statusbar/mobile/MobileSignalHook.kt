@@ -40,34 +40,78 @@ import java.util.concurrent.ConcurrentHashMap
 abstract class MobileSignalHook : StatusBarHook() {
 
     private val suppressedDualRowRoots = ConcurrentHashMap.newKeySet<Int>()
+    private val suppressedDualRowRootWidths = ConcurrentHashMap<Int, Int>()
 
-    /**
-     * HyperOS 4 为每个订阅各创建一张 ModernStatusBarMobileView。
-     * DualRowSignalHookV 自己已经在一个容器内同时绘制 SIM1/SIM2，若两张 root
-     * 都执行同一套注入，就会得到两组完全重复的“双排”。固定使用 slot 0
-     * 的 root 作为唯一宿主，slot 1+ root 整体隐藏；其它 MobileSignalHook 不受影响。
-     */
-    private fun suppressDuplicateDualRowRoot(rootView: ViewGroup, subId: Int): Boolean {
-        if (this !is DualRowSignalHookV) return false
-
-        val slot = SubscriptionManager.getSlotIndex(subId)
-        if (slot <= 0) {
-            // slot 0 是稳定宿主；INVALID_SIM_SLOT_INDEX(-1) 时先不隐藏，避免
-            // telephony 尚未初始化完成时误伤唯一可见的移动网络 root。
-            if (slot == 0) rootView.visibility = View.VISIBLE
-            return false
-        }
-
-        rootView.visibility = View.GONE
+    private fun hardCollapseDualRowRoot(rootView: ViewGroup, subId: Int, reason: String) {
         val identity = System.identityHashCode(rootView)
+        val lp = rootView.layoutParams
+        if (lp != null) {
+            suppressedDualRowRootWidths.putIfAbsent(identity, lp.width)
+            if (lp.width != 0) {
+                lp.width = 0
+                rootView.layoutParams = lp
+            }
+        }
+        // HyperOS 4's binder/flows may restore visibility after constructAndBind.
+        // Width=0 + alpha=0 keeps the duplicate physically absent even if a later
+        // collector toggles visibility back to VISIBLE.
+        rootView.alpha = 0f
+        rootView.visibility = View.GONE
         if (suppressedDualRowRoots.add(identity)) {
             XposedLog.i(
                 TAG,
                 lpparam.packageName,
-                "DualRowSignal: suppress duplicate mobile root subId=$subId slot=$slot root=${rootView.javaClass.name}"
+                "DualRowSignal: suppress duplicate mobile root subId=$subId $reason root=${rootView.javaClass.name}"
             )
         }
-        return true
+    }
+
+    private fun restoreDualRowHostIfNeeded(rootView: ViewGroup) {
+        val identity = System.identityHashCode(rootView)
+        val oldWidth = suppressedDualRowRootWidths.remove(identity) ?: return
+        val lp = rootView.layoutParams
+        if (lp != null) {
+            lp.width = oldWidth
+            rootView.layoutParams = lp
+        }
+        rootView.alpha = 1f
+        rootView.visibility = View.VISIBLE
+        suppressedDualRowRoots.remove(identity)
+    }
+
+    /**
+     * HyperOS 4 为每个订阅各创建一张 ModernStatusBarMobileView，而
+     * DualRowSignalHookV 在一个容器内已经同时绘制 SIM1/SIM2。
+     *
+     * 优先把默认数据卡对应的 root 作为唯一宿主；这比启动早期调用
+     * getSlotIndex() 更可靠，因为后者可能暂时返回 INVALID_SIM_SLOT_INDEX。
+     * 若默认数据卡尚不可用，再回退到 slot 0。
+     */
+    protected fun suppressDuplicateDualRowRoot(rootView: ViewGroup, subId: Int): Boolean {
+        if (this !is DualRowSignalHookV) return false
+
+        val defaultDataSubId = SubscriptionManager.getDefaultDataSubscriptionId()
+        val slot = SubscriptionManager.getSlotIndex(subId)
+        val hasDefaultDataSub = defaultDataSubId >= 0 &&
+            defaultDataSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID
+
+        val suppress = if (hasDefaultDataSub) {
+            subId != defaultDataSubId
+        } else {
+            slot > 0
+        }
+
+        if (suppress) {
+            hardCollapseDualRowRoot(
+                rootView,
+                subId,
+                "slot=$slot defaultDataSubId=$defaultDataSubId"
+            )
+            return true
+        }
+
+        restoreDualRowHostIfNeeded(rootView)
+        return false
     }
 
     /**
@@ -111,6 +155,11 @@ abstract class MobileSignalHook : StatusBarHook() {
 
                 MobileViewHelper.collectFlow(container, tintFlow) { triple ->
                     try {
+                        // Re-assert host ownership on every tint emission. Modern
+                        // pipeline collectors can change visibility after bind.
+                        if (subId >= 0 && suppressDuplicateDualRowRoot(container, subId)) {
+                            return@collectFlow
+                        }
                         callback(container, extractDarkInfo(triple))
                     } catch (e: Throwable) {
                         XposedLog.e(TAG, lpparam.packageName, "hookDarkMode flow error", e)
