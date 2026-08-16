@@ -30,6 +30,7 @@ import io.github.lingqiqi5211.ezhooktool.core.callMethodAs
 import io.github.lingqiqi5211.ezhooktool.core.findMethod
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getIntField
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createAfterHook
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 移动信号 Hook 扩展基类
@@ -37,6 +38,37 @@ import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createAfterHook
  * 继承 [StatusBarHook]，封装 mobile 场景的通用 Hook 入口和工具。
  */
 abstract class MobileSignalHook : StatusBarHook() {
+
+    private val suppressedDualRowRoots = ConcurrentHashMap.newKeySet<Int>()
+
+    /**
+     * HyperOS 4 为每个订阅各创建一张 ModernStatusBarMobileView。
+     * DualRowSignalHookV 自己已经在一个容器内同时绘制 SIM1/SIM2，若两张 root
+     * 都执行同一套注入，就会得到两组完全重复的“双排”。固定使用 slot 0
+     * 的 root 作为唯一宿主，slot 1+ root 整体隐藏；其它 MobileSignalHook 不受影响。
+     */
+    private fun suppressDuplicateDualRowRoot(rootView: ViewGroup, subId: Int): Boolean {
+        if (this !is DualRowSignalHookV) return false
+
+        val slot = SubscriptionManager.getSlotIndex(subId)
+        if (slot <= 0) {
+            // slot 0 是稳定宿主；INVALID_SIM_SLOT_INDEX(-1) 时先不隐藏，避免
+            // telephony 尚未初始化完成时误伤唯一可见的移动网络 root。
+            if (slot == 0) rootView.visibility = View.VISIBLE
+            return false
+        }
+
+        rootView.visibility = View.GONE
+        val identity = System.identityHashCode(rootView)
+        if (suppressedDualRowRoots.add(identity)) {
+            XposedLog.i(
+                TAG,
+                lpparam.packageName,
+                "DualRowSignal: suppress duplicate mobile root subId=$subId slot=$slot root=${rootView.javaClass.name}"
+            )
+        }
+        return true
+    }
 
     /**
      * Hook ModernStatusBarMobileView.constructAndBind
@@ -47,6 +79,7 @@ abstract class MobileSignalHook : StatusBarHook() {
             .createAfterHook { param ->
                 val rootView = param.result as? ViewGroup ?: return@createAfterHook
                 val subId = rootView.getIntField("subId")
+                if (suppressDuplicateDualRowRoot(rootView, subId)) return@createAfterHook
                 try {
                     callback(rootView, subId)
                 } catch (e: Throwable) {
@@ -64,6 +97,10 @@ abstract class MobileSignalHook : StatusBarHook() {
         miuiMobileIconBinder.findMethod { name("bind") }
             .createAfterHook { param ->
                 val container = param.args[0] as? ViewGroup ?: return@createAfterHook
+                val subId = runCatching { container.getIntField("subId") }.getOrDefault(-1)
+                if (subId >= 0 && suppressDuplicateDualRowRoot(container, subId)) {
+                    return@createAfterHook
+                }
                 val binding = param.result ?: return@createAfterHook
 
                 val tintFlow = findTintLightColorFlow(binding)
